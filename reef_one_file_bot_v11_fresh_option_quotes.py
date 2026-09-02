@@ -882,7 +882,7 @@ def monitor_active_trades_once():
     Poll ONLY the already-selected option contracts from Massive.
     Stock prices and new TradingView signals do not change a locked contract.
     """
-    store = _load_trade_store()
+    store = load_trade_store()
     trades = store.get("trades", {})
 
     active_symbols = [
@@ -984,7 +984,7 @@ def create_trade(symbol, direction, stock_price):
 
     with TRADE_STATE_LOCK:
         # Re-read state AFTER acquiring the lock.
-        store = _load_trade_store()
+        store = load_trade_store()
         trades = store.setdefault("trades", {})
 
         existing = trades.get(symbol)
@@ -1066,7 +1066,7 @@ def create_trade(symbol, direction, stock_price):
         except Exception:
             # If opening fails, remove only our unfinished reservation so a
             # later genuine signal can try again.
-            latest = _load_trade_store()
+            latest = load_trade_store()
             latest_trades = latest.setdefault("trades", {})
             current = latest_trades.get(symbol)
 
@@ -1084,7 +1084,7 @@ def _update_option_price_locked(option_ticker, option_price):
     Therefore CURRENT PRICE / CHANGE / TARGET PROGRESS stay live, not only when
     a target or stop event occurs.
     """
-    store = _load_trade_store()
+    store = load_trade_store()
     trades = store.get("trades", {})
     incoming = canonical_option_ticker(option_ticker)
 
