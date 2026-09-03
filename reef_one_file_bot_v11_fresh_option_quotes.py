@@ -406,7 +406,7 @@ def render_trade_card(s):
     # Footer / time / score
     d.text((95, 1380), f"Entry {format_entry_time_et(s.get('created_at'))}", font=_font(20), fill=muted)
     d.text((430, 1380), f"Score {s['score']}/100", font=_font(20), fill=muted)
-    d.text((695, 1380), "Powered by REEF OPTIONS BOT", font=_font(20, True), fill=blue)
+    d.text((695, 1380), "Powered by ORCA WHALE OPTIONS BOT", font=_font(20, True), fill=blue)
 
     out = Path(__file__).with_name("reef_trade_card.png")
     img.save(out, "PNG", optimize=True)
