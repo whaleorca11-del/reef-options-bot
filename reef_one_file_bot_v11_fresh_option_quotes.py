@@ -322,7 +322,7 @@ def render_trade_card(s):
     dte = _days_to_expiry(s["expiration"])
 
     # Header
-    d.text((95, 85), "REEF OPTIONS SIGNAL", font=_font(34, True), fill=blue)
+    d.text((95, 85), "ORCA WHALE OPTIONS SIGNAL", font=_font(34, True), fill=blue)
     badge = "LIVE" if status == "active" else ("STOPPED" if status == "stopped" else "COMPLETED")
     badge_color = green if status == "active" else (red if status == "stopped" else blue)
     d.rounded_rectangle((840, 76, 980, 126), radius=15, fill=(12, 62, 37) if status=="active" else (65, 25, 29))
