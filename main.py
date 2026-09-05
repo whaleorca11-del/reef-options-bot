@@ -853,16 +853,273 @@ def classify_snapshot_price(snapshot, now=None):
     return 0.0, "unavailable", None, quote_age, trade_age
 
 
+def _card_fitted_font(draw, text, maximum_size, maximum_width, minimum_size=16, bold=True):
+    """Return the largest existing card font that keeps one line inside its area."""
+    value = str(text)
+    for size in range(maximum_size, minimum_size - 1, -1):
+        font = bot._font(size, bold)
+        bounds = draw.textbbox((0, 0), value, font=font)
+        if bounds[2] - bounds[0] <= maximum_width:
+            return font
+    return bot._font(minimum_size, bold)
+
+
+def _card_gamma_values(state):
+    """Format only canonical Phase 5 Gamma results for the card."""
+    raw_status = str(
+        state.get("gamma_status") or state.get("gamma_regime") or "INSUFFICIENT DATA"
+    ).strip().upper()
+    regime = str(state.get("gamma_regime") or "").strip().upper()
+    flip = _present_number(state.get("gamma_flip"))
+    stock_price = _present_number(
+        state.get("gamma_stock_price")
+        if state.get("gamma_stock_price") is not None
+        else state.get("stock_price")
+    )
+
+    if raw_status == "FOUND" and flip is not None and flip > 0:
+        position = ""
+        if stock_price is not None and stock_price > 0:
+            position = (
+                "ABOVE FLIP" if stock_price > flip
+                else "BELOW FLIP" if stock_price < flip
+                else "AT FLIP"
+            )
+        status_parts = [
+            value for value in (regime if regime not in ("", "FOUND") else "", position)
+            if value
+        ]
+        return f"${flip:.2f}", " • ".join(status_parts) or "FOUND"
+
+    if raw_status == "NO FLIP IN RANGE":
+        gamma_status = regime if regime not in ("", "FOUND") else "NO FLIP IN RANGE"
+        return "NO FLIP IN RANGE", gamma_status
+
+    if raw_status in ("INSUFFICIENT DATA", "INSUFFICIENT"):
+        return "INSUFFICIENT DATA", "INSUFFICIENT DATA"
+
+    if raw_status == "CALCULATION UNAVAILABLE":
+        return "INSUFFICIENT DATA", "INSUFFICIENT DATA"
+
+    return "INSUFFICIENT DATA", "INSUFFICIENT DATA"
+
+
+def _paste_card_logo(image, symbol, box):
+    """Fill the existing logo square while preserving the downloaded logo ratio."""
+    x1, y1, x2, y2 = box
+    inner_width = max(1, x2 - x1 - 8)
+    inner_height = max(1, y2 - y1 - 8)
+    logo = bot.fetch_company_logo(symbol, size=max(inner_width, inner_height))
+    if logo is None:
+        draw = bot.ImageDraw.Draw(image)
+        label = str(symbol).upper()
+        font = _card_fitted_font(draw, label, 34, inner_width, 18, True)
+        bounds = draw.textbbox((0, 0), label, font=font)
+        draw.text(
+            (
+                x1 + ((x2 - x1) - (bounds[2] - bounds[0])) // 2,
+                y1 + ((y2 - y1) - (bounds[3] - bounds[1])) // 2 - bounds[1],
+            ),
+            label,
+            font=font,
+            fill=(242, 247, 250),
+        )
+        return
+    logo.thumbnail((inner_width, inner_height), bot.Image.Resampling.LANCZOS)
+    x = x1 + ((x2 - x1) - logo.width) // 2
+    y = y1 + ((y2 - y1) - logo.height) // 2
+    image.paste(logo, (x, y), logo)
+
+
+def render_trade_card(state):
+    """Render the approved 1080×1500 ORCA Telegram card from existing trade state."""
+    width, height = 1080, 1500
+    background = (5, 17, 29)
+    panel = (8, 25, 40)
+    detail_panel = (12, 34, 52)
+    line = (38, 63, 82)
+    white = (242, 247, 250)
+    muted = (157, 174, 188)
+    blue = (73, 171, 255)
+    green = (45, 220, 90)
+    red = (255, 69, 69)
+
+    image = bot.Image.new("RGB", (width, height), background)
+    draw = bot.ImageDraw.Draw(image)
+    for x in range(0, width, 90):
+        draw.line((x, 0, x, height), fill=(7, 24, 38), width=1)
+    for y in range(0, height, 90):
+        draw.line((0, y, width, y), fill=(7, 24, 38), width=1)
+    draw.rounded_rectangle(
+        (42, 42, width - 42, height - 42),
+        radius=36,
+        fill=panel,
+        outline=(25, 55, 76),
+        width=2,
+    )
+
+    symbol = str(state["symbol"]).upper()
+    company = bot.COMPANY_NAMES.get(symbol, symbol)
+    direction = str(state["direction"]).upper()
+    direction_color = green if direction == "CALL" else red
+    status = str(state.get("status", "active")).lower()
+    achieved = max(0, min(5, int(state.get("achieved", 0))))
+    entry = bot.safe_float(state["entry_price"])
+    current = bot.safe_float(state.get("current_price"), entry)
+    change = current - entry
+    change_percent = ((current / entry) - 1) * 100 if entry else 0.0
+    targets = list(state["targets"])
+    stop = bot.safe_float(state["stop_loss"])
+    dte = bot._days_to_expiry(state["expiration"])
+    contract = bot.canonical_option_ticker(state["contract_ticker"])
+    gamma_flip, gamma_status = _card_gamma_values(state)
+
+    draw.text((65, 78), "ORCA WHALE OPTIONS SIGNAL", font=bot._font(39, True), fill=blue)
+    badge = "LIVE" if status == "active" else ("STOPPED" if status == "stopped" else "COMPLETED")
+    badge_color = green if status == "active" else (red if status == "stopped" else blue)
+    draw.rounded_rectangle(
+        (840, 76, 980, 126),
+        radius=15,
+        fill=(12, 62, 37) if status == "active" else (65, 25, 29),
+    )
+    badge_font = _card_fitted_font(draw, badge, 24, 112, 17, True)
+    badge_bounds = draw.textbbox((0, 0), badge, font=badge_font)
+    draw.text(
+        (910 - (badge_bounds[2] - badge_bounds[0]) / 2, 84),
+        badge,
+        font=badge_font,
+        fill=badge_color,
+    )
+
+    logo_box = (75, 158, 250, 333)
+    draw.rounded_rectangle(
+        logo_box, radius=28, fill=(12, 41, 62), outline=(30, 85, 116), width=2
+    )
+    _paste_card_logo(image, symbol, logo_box)
+    direction_text = f"{direction} ↗" if direction == "CALL" else f"{direction} ↘"
+    draw.text((285, 166), direction_text, font=bot._font(55, True), fill=direction_color)
+    company_font = _card_fitted_font(draw, company, 30, 690, 19, True)
+    draw.text((285, 242), company, font=company_font, fill=white)
+
+    contract_box = (285, 302, 970, 370)
+    draw.rounded_rectangle(contract_box, radius=18, fill=detail_panel, outline=line, width=2)
+    contract_font = _card_fitted_font(draw, contract, 34, 625, 20, True)
+    draw.text((315, 317), contract, font=contract_font, fill=white)
+    summary = (
+        f"{symbol}  ${bot.safe_float(state['stock_price']):.2f}  {direction}   "
+        f"{state['expiration']}  ({dte}DTE)"
+    )
+    summary_font = _card_fitted_font(draw, summary, 25, 890, 18, False)
+    draw.text((75, 402), summary, font=summary_font, fill=muted)
+
+    metric_y = 480
+    metrics = [(75, "ENTRY PRICE", entry), (390, "CURRENT PRICE", current), (705, "CHANGE", None)]
+    for x, label, value in metrics:
+        draw.text((x, metric_y), label, font=bot._font(22, True), fill=blue)
+        if label == "CHANGE":
+            text = f"{change:+.2f} ({change_percent:+.1f}%)"
+            font = _card_fitted_font(draw, text, 40, 300, 25, True)
+            draw.text((x, metric_y + 47), text, font=font, fill=green if change_percent >= 0 else red)
+        else:
+            draw.text((x, metric_y + 47), f"${value:.2f}", font=bot._font(42, True), fill=white)
+    draw.line((70, 602, 1010, 602), fill=line, width=2)
+
+    draw.text((75, 632), "PROFIT TARGETS", font=bot._font(31, True), fill=blue)
+    percentages = [20, 45, 70, 100, 150]
+    target_cells = [
+        (75, 690), (390, 690), (705, 690),
+        (75, 812), (390, 812),
+    ]
+    for index, (price, percentage, (x, y)) in enumerate(
+        zip(targets, percentages, target_cells)
+    ):
+        hit = index < achieved
+        marker_color = green if hit else blue
+        draw.ellipse((x, y + 3, x + 34, y + 37), fill=panel, outline=marker_color, width=3)
+        if hit:
+            draw.text((x + 7, y + 1), "✓", font=bot._font(25, True), fill=green)
+        label_x = x + 54
+        draw.text((label_x, y), f"T{index + 1}", font=bot._font(27, True), fill=white)
+        price_text = f"${bot.safe_float(price):.2f}"
+        draw.text((label_x + 48, y), price_text, font=bot._font(27, True), fill=white)
+        draw.text(
+            (label_x + 48, y + 40),
+            f"+{percentage}%",
+            font=bot._font(22, True),
+            fill=green,
+        )
+
+    draw.rounded_rectangle(
+        (705, 807, 970, 905), radius=20, fill=(45, 20, 25), outline=(145, 38, 48), width=2
+    )
+    draw.text((728, 824), "STOP LOSS", font=bot._font(21, True), fill=red)
+    stop_text = f"${stop:.2f}  (-45%)"
+    stop_font = _card_fitted_font(draw, stop_text, 29, 220, 22, True)
+    draw.text((728, 857), stop_text, font=stop_font, fill=white)
+
+    draw.text((75, 930), f"TARGET PROGRESS   {achieved}/5", font=bot._font(24, True), fill=white)
+    progress_points = [105, 315, 525, 735, 945]
+    draw.line((105, 990, 945, 990), fill=(93, 111, 126), width=5)
+    for index, x in enumerate(progress_points):
+        hit = index < achieved
+        draw.ellipse(
+            (x - 25, 965, x + 25, 1015),
+            fill=green if hit else panel,
+            outline=green if hit else (130, 151, 167),
+            width=4,
+        )
+        if hit:
+            draw.text((x - 10, 969), "✓", font=bot._font(32, True), fill=white)
+        draw.text((x - 20, 1028), f"T{index + 1}", font=bot._font(20, True), fill=white)
+
+    draw.rounded_rectangle((70, 1085, 1010, 1355), radius=24, fill=detail_panel)
+    details = [
+        ("TICKER", symbol),
+        ("EXPIRATION", f"{state['expiration']} ({dte}DTE)"),
+        ("STRIKE", f"${bot.safe_float(state['strike']):.2f}"),
+        ("CONTRACT TYPE", direction),
+        ("CONTRACT", contract),
+        ("GAMMA FLIP", gamma_flip),
+        ("GAMMA STATUS", gamma_status),
+    ]
+    detail_y = 1100
+    for label, value in details:
+        draw.text((105, detail_y), label, font=bot._font(19, True), fill=muted)
+        value_text = str(value)
+        value_font = _card_fitted_font(draw, value_text, 20, 610, 14, True)
+        bounds = draw.textbbox((0, 0), value_text, font=value_font)
+        draw.text(
+            (975 - (bounds[2] - bounds[0]), detail_y),
+            value_text,
+            font=value_font,
+            fill=white,
+        )
+        detail_y += 34
+
+    draw.text(
+        (75, 1392),
+        f"Entry {bot.format_entry_time_et(state.get('created_at'))}",
+        font=bot._font(19),
+        fill=muted,
+    )
+    draw.text((410, 1392), f"Score {state['score']}/100", font=bot._font(19), fill=muted)
+    footer = "Powered by ORCA WHALE OPTIONS"
+    footer_font = _card_fitted_font(draw, footer, 19, 390, 15, True)
+    footer_bounds = draw.textbbox((0, 0), footer, font=footer_font)
+    draw.text((985 - (footer_bounds[2] - footer_bounds[0]), 1392), footer, font=footer_font, fill=blue)
+
+    output = Path(bot.__file__).with_name("reef_trade_card.png")
+    image.save(output, "PNG", optimize=True)
+    return output
+
+
 def _render_unique_card(state):
-    """Adapt the historical renderer into a safely unique, temporary card."""
+    """Render the canonical card into a safely unique temporary image."""
     unique = Path(bot.__file__).with_name(
         f"reef_trade_card_{state.get('symbol', 'trade')}_{state.get('message_id', 'new')}_{uuid.uuid4().hex}.png"
     )
-    # The approved renderer has a fixed output name.  Serialize just that
-    # legacy render/copy operation, then callers exclusively use the copy.
     with CARD_RENDER_LOCK:
-        shared = _ORIGINAL_RENDER_TRADE_CARD(state)
-        _populate_gamma_card_fields(shared, state)
+        shared = render_trade_card(state)
         shutil.copy2(shared, unique)
         try:
             Path(shared).unlink()
