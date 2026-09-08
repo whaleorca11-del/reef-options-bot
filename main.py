@@ -12,6 +12,7 @@ import shutil
 import threading
 import time
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1223,6 +1224,141 @@ def massive_chain(symbol, direction):
     return results
 
 
+def _first_valid_stock_price(payload):
+    """Return the first positive price field from a Massive stock response."""
+    preferred_paths = (
+        ("lastTrade", "p"),
+        ("last_trade", "p"),
+        ("min", "c"),
+        ("minute", "c"),
+        ("results", "lastTrade", "p"),
+        ("results", "last_trade", "p"),
+        ("results", "p"),
+        ("results", "c"),
+        ("p",),
+        ("c",),
+        ("price",),
+        ("close",),
+        ("last",),
+    )
+
+    def at_path(value, path):
+        for key in path:
+            if not isinstance(value, dict):
+                return None
+            value = value.get(key)
+        return value
+
+    for path in preferred_paths:
+        price = _present_number(at_path(payload, path))
+        if price is not None and price > 0:
+            return price
+
+    price_keys = {"p", "c", "price", "close", "last"}
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if str(key).lower() in price_keys:
+                    price = _present_number(nested)
+                    if price is not None and price > 0:
+                        return price
+                found = walk(nested)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = walk(nested)
+                if found is not None:
+                    return found
+        return None
+
+    return walk(payload)
+
+
+def _massive_stock_get(path, api_key, params=None):
+    """Fetch one stock endpoint without allowing endpoint failure to stop scans."""
+    query = dict(params or {})
+    query["apiKey"] = api_key
+    response = requests.get(f"{bot.BASE_URL}{path}", params=query, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_underlying_price(symbol, call_raw, put_raw):
+    """Use direct Massive stock prices, retaining option inference as the last fallback."""
+    symbol = str(symbol or "").upper().strip()
+    api_key = bot.env("MASSIVE_API_KEY")
+
+    if api_key:
+        try:
+            payload = _massive_stock_get(
+                f"/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}",
+                api_key,
+            )
+            price = _first_valid_stock_price(payload)
+            if price is not None and price > 0:
+                print(f"{symbol} stock_price_source: snapshot price={price:.4f}")
+                return price, "snapshot"
+        except Exception as error:
+            print(f"{symbol} snapshot underlying price failed: {error}")
+
+        try:
+            payload = _massive_stock_get(f"/v2/last/trade/{symbol}", api_key)
+            price = _first_valid_stock_price(payload)
+            if price is not None and price > 0:
+                print(f"{symbol} stock_price_source: last_trade price={price:.4f}")
+                return price, "last_trade"
+        except Exception as error:
+            print(f"{symbol} last trade underlying price failed: {error}")
+
+        try:
+            now = bot.now_new_york()
+            end_date = now.date()
+            start_date = end_date - timedelta(days=7)
+            payload = _massive_stock_get(
+                f"/v2/aggs/ticker/{symbol}/range/1/minute/"
+                f"{start_date.isoformat()}/{end_date.isoformat()}",
+                api_key,
+                {"sort": "desc", "limit": 5000},
+            )
+            bars = payload.get("results") if isinstance(payload, dict) else None
+            if isinstance(bars, list):
+                bars = sorted(
+                    bars,
+                    key=lambda bar: _present_number(
+                        (bar or {}).get("t")
+                        if isinstance(bar, dict)
+                        else None
+                    ) or 0,
+                    reverse=True,
+                )
+                price = next(
+                    (
+                        _present_number(bar.get("c"))
+                        for bar in bars
+                        if isinstance(bar, dict)
+                        and _present_number(bar.get("c")) is not None
+                        and _present_number(bar.get("c")) > 0
+                    ),
+                    None,
+                )
+                if price is not None and price > 0:
+                    print(
+                        f"{symbol} stock_price_source: minute_aggregate price={price:.4f}"
+                    )
+                    return price, "minute_aggregate"
+        except Exception as error:
+            print(f"{symbol} minute aggregate underlying price failed: {error}")
+
+    price, _ = bot.infer_underlying_price(call_raw, put_raw)
+    if price > 0:
+        print(f"{symbol} stock_price_source: options_inference price={price:.4f}")
+        return price, "options_inference"
+    print(f"{symbol} stock_price_source: options_inference unavailable")
+    return price, "options_inference"
+
+
 def _gamma_t_years(expiration, now):
     """Return near-term expiry time using New York dates and 0DTE session time."""
     try:
@@ -1855,7 +1991,7 @@ def scan_symbol_options(symbol):
 
     call_raw = massive_chain(symbol, "CALL")
     put_raw = massive_chain(symbol, "PUT")
-    stock_price, stock_source = bot.infer_underlying_price(call_raw, put_raw)
+    stock_price, stock_source = fetch_underlying_price(symbol, call_raw, put_raw)
     if stock_price <= 0:
         return {
             "symbol": symbol,
