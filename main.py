@@ -20,6 +20,9 @@ import requests
 
 import orca_whale_options_bot_FAST_60S_5S as bot
 
+# Canonical production scanner threshold for this entry point.
+bot.AUTO_SCAN_MIN_SCORE = 75.0
+
 
 SCAN_IN_PROGRESS_LOCK = threading.Lock()
 CARD_RENDER_LOCK = threading.Lock()
