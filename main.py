@@ -31,6 +31,11 @@ _STATE_LOAD_STATUS = "not loaded"
 _RESTORED_ACTIVE_TRADE_COUNT = 0
 _RECOVERY_REQUIRED_COUNT = 0
 _LAST_SCAN_DECISIONS = {}
+UNDERLYING_PRICE_CACHE_TTL_SECONDS = 120.0
+UNDERLYING_PRICE_BACKOFF_SECONDS = 15.0
+_UNDERLYING_PRICE_CACHE = {}
+_UNDERLYING_PRICE_CACHE_LOCK = threading.Lock()
+_UNDERLYING_PRICE_BACKOFF_UNTIL = 0.0
 
 
 class TradeStateCorruptionError(RuntimeError):
@@ -1286,41 +1291,41 @@ def _massive_stock_get(path, api_key, params=None):
 
 
 def fetch_underlying_price(symbol, call_raw, put_raw):
-    """Use direct Massive stock prices, retaining option inference as the last fallback."""
+    """Use a cached/latest minute aggregate, retaining option inference as fallback."""
+    global _UNDERLYING_PRICE_BACKOFF_UNTIL
     symbol = str(symbol or "").upper().strip()
     api_key = bot.env("MASSIVE_API_KEY")
+    now_monotonic = time.monotonic()
+
+    with _UNDERLYING_PRICE_CACHE_LOCK:
+        cached = _UNDERLYING_PRICE_CACHE.get(symbol)
+        backoff_active = now_monotonic < _UNDERLYING_PRICE_BACKOFF_UNTIL
+    if cached and now_monotonic - cached["timestamp"] <= UNDERLYING_PRICE_CACHE_TTL_SECONDS:
+        print(
+            f"{symbol} stock_price_source: cached_minute_aggregate "
+            f"price={cached['price']:.4f}"
+        )
+        return cached["price"], "cached_minute_aggregate"
+
+    if backoff_active:
+        print(f"{symbol} stock price request skipped during global 429 backoff")
+        price, _ = bot.infer_underlying_price(call_raw, put_raw)
+        print(
+            f"{symbol} stock_price_source: options_inference"
+            f"{f' price={price:.4f}' if price > 0 else ' unavailable'}"
+        )
+        return price, "options_inference"
 
     if api_key:
         try:
-            payload = _massive_stock_get(
-                f"/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}",
-                api_key,
-            )
-            price = _first_valid_stock_price(payload)
-            if price is not None and price > 0:
-                print(f"{symbol} stock_price_source: snapshot price={price:.4f}")
-                return price, "snapshot"
-        except Exception as error:
-            print(f"{symbol} snapshot underlying price failed: {error}")
-
-        try:
-            payload = _massive_stock_get(f"/v2/last/trade/{symbol}", api_key)
-            price = _first_valid_stock_price(payload)
-            if price is not None and price > 0:
-                print(f"{symbol} stock_price_source: last_trade price={price:.4f}")
-                return price, "last_trade"
-        except Exception as error:
-            print(f"{symbol} last trade underlying price failed: {error}")
-
-        try:
             now = bot.now_new_york()
             end_date = now.date()
-            start_date = end_date - timedelta(days=7)
+            start_date = end_date - timedelta(days=3)
             payload = _massive_stock_get(
                 f"/v2/aggs/ticker/{symbol}/range/1/minute/"
                 f"{start_date.isoformat()}/{end_date.isoformat()}",
                 api_key,
-                {"sort": "desc", "limit": 5000},
+                {"sort": "desc", "limit": 10},
             )
             bars = payload.get("results") if isinstance(payload, dict) else None
             if isinstance(bars, list):
@@ -1344,12 +1349,27 @@ def fetch_underlying_price(symbol, call_raw, put_raw):
                     None,
                 )
                 if price is not None and price > 0:
+                    with _UNDERLYING_PRICE_CACHE_LOCK:
+                        _UNDERLYING_PRICE_CACHE[symbol] = {
+                            "price": price,
+                            "timestamp": time.monotonic(),
+                        }
                     print(
                         f"{symbol} stock_price_source: minute_aggregate price={price:.4f}"
                     )
                     return price, "minute_aggregate"
         except Exception as error:
             print(f"{symbol} minute aggregate underlying price failed: {error}")
+            response = getattr(error, "response", None)
+            if response is not None and getattr(response, "status_code", None) == 429:
+                with _UNDERLYING_PRICE_CACHE_LOCK:
+                    _UNDERLYING_PRICE_BACKOFF_UNTIL = (
+                        time.monotonic() + UNDERLYING_PRICE_BACKOFF_SECONDS
+                    )
+                print(
+                    f"{symbol} stock price HTTP 429; global backoff "
+                    f"{UNDERLYING_PRICE_BACKOFF_SECONDS:.0f}s"
+                )
 
     price, _ = bot.infer_underlying_price(call_raw, put_raw)
     if price > 0:
