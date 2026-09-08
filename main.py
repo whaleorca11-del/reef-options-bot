@@ -573,7 +573,8 @@ def calculate_trade_confidence(contract, direction_edge, gamma_state, entry_sour
 
 
 def _conservative_assessment(
-    direction, contract, direction_edge, gamma_info, stock_price
+    direction, contract, direction_edge, gamma_info, stock_price,
+    minimum_score=None, minimum_edge=None, allow_strong_score_exception=False,
 ):
     """Return explicit quality/price WAIT decisions for one exact candidate."""
     if not contract:
@@ -587,9 +588,22 @@ def _conservative_assessment(
     entry, entry_source = choose_initial_price(contract)
     reasons = []
     score = bot.safe_float(contract.get("score"))
+    score_requirement = (
+        ORCA_CONSERVATIVE_MIN_SCORE
+        if minimum_score is None else float(minimum_score)
+    )
+    edge_requirement = (
+        ORCA_MIN_DIRECTION_EDGE
+        if minimum_edge is None else float(minimum_edge)
+    )
+    strong_score_exception = (
+        allow_strong_score_exception
+        and score >= 70.0
+        and direction_edge >= 12.0
+    )
     dte = contract.get("dte")
     theta_points = bot.safe_float((contract.get("score_breakdown") or {}).get("theta"))
-    if score < ORCA_CONSERVATIVE_MIN_SCORE:
+    if score < score_requirement and not strong_score_exception:
         reasons.append("WAIT - SCORE TOO LOW")
     if contract.get("delta") is None:
         reasons.append("WAIT - DATA INCOMPLETE")
@@ -607,7 +621,7 @@ def _conservative_assessment(
         reasons.append("WAIT - DATA INCOMPLETE")
     if bot.safe_float(contract.get("completeness_percent")) < CONSERVATIVE_MIN_COMPLETENESS:
         reasons.append("WAIT - DATA INCOMPLETE")
-    if direction_edge < ORCA_MIN_DIRECTION_EDGE:
+    if direction_edge < edge_requirement:
         reasons.append("WAIT - DIRECTION UNCLEAR")
     if gamma_state == "opposed":
         reasons.append("WAIT - GAMMA OPPOSED")
@@ -1939,14 +1953,50 @@ def auto_monitor_loop():
         bot.time.sleep(interval)
 
 
-def _side_diagnostic(direction, side_stats, strength, other_strength, gamma_info, stock_price):
+def _scan_mode_context(now=None):
+    """Return the opening-session requirements for the current New York time."""
+    now = now or bot.now_new_york()
+    minutes = now.hour * 60 + now.minute
+    if 9 * 60 + 30 <= minutes < 10 * 60:
+        return {
+            "scan_mode": "OPENING_FAST",
+            "required_score": 72.0,
+            "required_edge": 8.0,
+            "strong_score": 70.0,
+            "strong_edge": 12.0,
+            "allow_strong_score_exception": True,
+        }
+    return {
+        "scan_mode": "NORMAL",
+        "required_score": float(bot.AUTO_SCAN_MIN_SCORE),
+        "required_edge": float(bot.AUTO_SCAN_MIN_EDGE),
+        "strong_score": None,
+        "strong_edge": None,
+        "allow_strong_score_exception": False,
+    }
+
+
+def _side_diagnostic(
+    direction, side_stats, strength, other_strength, gamma_info, stock_price,
+    scan_context=None,
+):
+    scan_context = scan_context or _scan_mode_context()
     best = side_stats.get("best") or {}
     score = bot.safe_float(best.get("score"))
     volume = bot.safe_float(side_stats.get("volume"))
-    has_eligible_contract = bool(best)
-    score_ok = has_eligible_contract and score >= bot.AUTO_SCAN_MIN_SCORE
+    has_eligible_contract = bool(best) and bool(best.get("selection_eligible"))
     edge = strength - other_strength
-    edge_ok = edge >= bot.AUTO_SCAN_MIN_EDGE
+    required_score = scan_context["required_score"]
+    required_edge = scan_context["required_edge"]
+    strong_exception = (
+        scan_context["allow_strong_score_exception"]
+        and score >= scan_context["strong_score"]
+        and edge >= scan_context["strong_edge"]
+    )
+    score_ok = has_eligible_contract and (
+        score >= required_score or strong_exception
+    )
+    edge_ok = edge >= required_edge
     volume_ok = volume >= bot.AUTO_SCAN_MIN_VOLUME
     gamma_state = gamma_direction_state(direction, stock_price, gamma_info)
     gamma_ok = gamma_state != "opposed"
@@ -1955,9 +2005,9 @@ def _side_diagnostic(direction, side_stats, strength, other_strength, gamma_info
     if not has_eligible_contract:
         reasons.append("no eligible contract after quality safeguards")
     if not score_ok:
-        reasons.append(f"score {score:.1f} < {bot.AUTO_SCAN_MIN_SCORE:.1f}")
+        reasons.append(f"score {score:.1f} < {required_score:.1f}")
     if not edge_ok:
-        reasons.append(f"edge {edge:.1f} < {bot.AUTO_SCAN_MIN_EDGE:.1f}")
+        reasons.append(f"edge {edge:.1f} < {required_edge:.1f}")
     if not volume_ok:
         reasons.append(f"volume {volume:.0f} < {bot.AUTO_SCAN_MIN_VOLUME:.0f}")
     if not gamma_ok:
@@ -1971,6 +2021,10 @@ def _side_diagnostic(direction, side_stats, strength, other_strength, gamma_info
         "score": score,
         "strength": strength,
         "edge": round(edge, 2),
+        "scan_mode": scan_context["scan_mode"],
+        "required_score": required_score,
+        "required_edge": required_edge,
+        "strong_score_exception": strong_exception,
         "volume": round(volume, 0),
         "open_interest": round(bot.safe_float(side_stats.get("open_interest")), 0),
         "score_breakdown": best.get("score_breakdown") or {},
@@ -2001,6 +2055,7 @@ def _side_diagnostic(direction, side_stats, strength, other_strength, gamma_info
 def scan_symbol_options(symbol):
     """Evaluate CALL and PUT independently and report every qualification check."""
     symbol = str(symbol or "").upper().strip()
+    scan_context = _scan_mode_context()
 
     with bot.TRADE_STATE_LOCK:
         store = bot._load_trade_store()
@@ -2019,6 +2074,9 @@ def scan_symbol_options(symbol):
         return {
             "symbol": symbol,
             "accepted": False,
+            "scan_mode": scan_context["scan_mode"],
+            "required_score": scan_context["required_score"],
+            "required_edge": scan_context["required_edge"],
             "call": {"accepted": False, "reason": "underlying price unavailable"},
             "put": {"accepted": False, "reason": "underlying price unavailable"},
             "ignored": "underlying price unavailable",
@@ -2067,6 +2125,9 @@ def scan_symbol_options(symbol):
                     "symbol": symbol,
                     "accepted": True,
                     "ignored": "active contract already locked",
+                    "scan_mode": scan_context["scan_mode"],
+                    "required_score": scan_context["required_score"],
+                    "required_edge": scan_context["required_edge"],
                     "call": {"accepted": False, "reason": locked_reason},
                     "put": {"accepted": False, "reason": locked_reason},
                     "gamma_flip": live.get("gamma_flip"),
@@ -2089,6 +2150,9 @@ def scan_symbol_options(symbol):
             "symbol": symbol,
             "accepted": True,
             "ignored": "contract opening/locked",
+            "scan_mode": scan_context["scan_mode"],
+            "required_score": scan_context["required_score"],
+            "required_edge": scan_context["required_edge"],
             "call": {"accepted": False, "reason": locked_reason},
             "put": {"accepted": False, "reason": locked_reason},
         }
@@ -2105,20 +2169,33 @@ def scan_symbol_options(symbol):
     call_strength = bot._direction_strength(call_stats, put_stats)
     put_strength = bot._direction_strength(put_stats, call_stats)
     call_diag = _side_diagnostic(
-        "CALL", call_stats, call_strength, put_strength, gamma_info, stock_price
+        "CALL", call_stats, call_strength, put_strength, gamma_info, stock_price,
+        scan_context,
     )
     put_diag = _side_diagnostic(
-        "PUT", put_stats, put_strength, call_strength, gamma_info, stock_price
+        "PUT", put_stats, put_strength, call_strength, gamma_info, stock_price,
+        scan_context,
     )
     assessments = {}
     if ORCA_CONSERVATIVE_MODE:
+        assessment_requirements = {}
+        if scan_context["scan_mode"] == "OPENING_FAST":
+            assessment_requirements = {
+                "minimum_score": scan_context["required_score"],
+                "minimum_edge": scan_context["required_edge"],
+                "allow_strong_score_exception": scan_context[
+                    "allow_strong_score_exception"
+                ],
+            }
         assessments["CALL"] = _conservative_assessment(
             "CALL", call_stats.get("best"), call_strength - put_strength,
             gamma_info, stock_price,
+            **assessment_requirements,
         )
         assessments["PUT"] = _conservative_assessment(
             "PUT", put_stats.get("best"), put_strength - call_strength,
             gamma_info, stock_price,
+            **assessment_requirements,
         )
         ambiguous = bool(
             call_stats.get("best") and put_stats.get("best")
@@ -2146,6 +2223,9 @@ def scan_symbol_options(symbol):
     result = {
         "symbol": symbol,
         "accepted": True,
+        "scan_mode": scan_context["scan_mode"],
+        "required_score": scan_context["required_score"],
+        "required_edge": scan_context["required_edge"],
         "stock_price": round(stock_price, 2),
         "stock_price_source": stock_source,
         "call": call_diag,
