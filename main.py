@@ -39,6 +39,15 @@ UNDERLYING_PRICE_BACKOFF_SECONDS = 15.0
 _UNDERLYING_PRICE_CACHE = {}
 _UNDERLYING_PRICE_CACHE_LOCK = threading.Lock()
 _UNDERLYING_PRICE_BACKOFF_UNTIL = 0.0
+MASSIVE_CHAIN_CACHE_TTL_SECONDS = float(
+    os.getenv("MASSIVE_CHAIN_CACHE_TTL_SECONDS", "90")
+)
+MASSIVE_RATE_LIMIT_BACKOFF_SECONDS = float(
+    os.getenv("MASSIVE_RATE_LIMIT_BACKOFF_SECONDS", "30")
+)
+_MASSIVE_CHAIN_CACHE = {}
+_MASSIVE_CHAIN_CACHE_LOCK = threading.Lock()
+_MASSIVE_BACKOFF_UNTIL = 0.0
 
 
 class TradeStateCorruptionError(RuntimeError):
@@ -173,7 +182,7 @@ SCORE_DELTA_EXTREME_LOW = float(os.getenv("SCORE_DELTA_EXTREME_LOW", "0.10"))
 SCORE_DELTA_EXTREME_HIGH = float(os.getenv("SCORE_DELTA_EXTREME_HIGH", "0.90"))
 SCORE_MIN_OPEN_INTEREST = max(0.0, float(os.getenv("SCORE_MIN_OPEN_INTEREST", "100")))
 SCORE_MIN_OPTION_VOLUME = max(0.0, float(os.getenv("SCORE_MIN_OPTION_VOLUME", "50")))
-SCORE_MAX_DTE = max(0, int(os.getenv("SCORE_MAX_DTE", "14")))
+SCORE_MAX_DTE = max(0, int(os.getenv("SCORE_MAX_DTE", "7")))
 SCORE_DTE_0_POINTS = float(os.getenv("SCORE_DTE_0_POINTS", "7"))
 SCORE_DTE_1_3_POINTS = float(os.getenv("SCORE_DTE_1_3_POINTS", "10"))
 SCORE_DTE_4_7_POINTS = float(os.getenv("SCORE_DTE_4_7_POINTS", "7"))
@@ -204,7 +213,7 @@ ORCA_CONSERVATIVE_MODE = os.getenv(
     "ORCA_CONSERVATIVE_MODE", "1"
 ).strip().lower() not in ("0", "false", "no")
 ORCA_CONSERVATIVE_MIN_SCORE = float(
-    os.getenv("ORCA_CONSERVATIVE_MIN_SCORE", "82")
+    os.getenv("ORCA_CONSERVATIVE_MIN_SCORE", "75")
 )
 ORCA_MIN_DIRECTION_EDGE = max(
     0.0, float(os.getenv("ORCA_MIN_DIRECTION_EDGE", "8"))
@@ -311,7 +320,11 @@ def calculate_score(contract, stock_price, now=None):
     iv = contract.get("iv")
     theta = contract.get("theta")
     dte = _contract_dte(contract.get("expiration"), now)
-    price = bot.safe_float(contract.get("midpoint") or contract.get("last"))
+    price = bot.safe_float(
+        contract.get("midpoint")
+        or contract.get("last")
+        or contract.get("day_close")
+    )
 
     if ad is None:
         delta_points = 0.0
@@ -452,9 +465,11 @@ def calculate_score(contract, stock_price, now=None):
 class ScoredCandidateList(list):
     """Eligible candidates plus diagnostics for every scored alternative."""
 
-    def __init__(self, eligible, all_candidates):
+    def __init__(self, eligible, all_candidates, raw_count=0, skipped_identity=0):
         super().__init__(eligible)
         self.all_candidates = all_candidates
+        self.raw_count = raw_count
+        self.skipped_identity = skipped_identity
 
 
 def _candidate_diagnostic(contract, winner_score):
@@ -478,9 +493,12 @@ def _candidate_diagnostic(contract, winner_score):
 def _prepare_side(raw_chain, stock_price):
     """Score all near-term expirations so safer 1-3 DTE can outrank 0DTE."""
     all_candidates = []
+    raw_count = len(raw_chain or [])
+    skipped_identity = 0
     for raw in raw_chain or []:
         contract = normalize_contract(raw, stock_price)
         if not contract["ticker"] or not contract["expiration"]:
+            skipped_identity += 1
             continue
         calculate_score(contract, stock_price)
         all_candidates.append(contract)
@@ -493,7 +511,10 @@ def _prepare_side(raw_chain, stock_price):
         -item["score"], item["distance"],
         -(item.get("volume") or 0), -(item.get("open_interest") or 0),
     ))
-    candidates = ScoredCandidateList(eligible, all_candidates)
+    candidates = ScoredCandidateList(
+        eligible, all_candidates, raw_count=raw_count,
+        skipped_identity=skipped_identity,
+    )
     return candidates, eligible[0]["expiration"] if eligible else None
 
 
@@ -519,17 +540,22 @@ def _side_flow_stats(contracts):
         ],
         "candidate_count": len(all_candidates),
         "eligible_candidate_count": len(eligible),
+        "raw_count": getattr(contracts, "raw_count", len(all_candidates)),
+        "skipped_identity": getattr(contracts, "skipped_identity", 0),
     }
 
 
 def choose_initial_price(contract):
-    """Use only a fresh midpoint or recent trade as an executable entry mark."""
+    """Prefer fresh prices, then expose delayed session close as a reference."""
     midpoint = bot.safe_float(contract.get("midpoint"))
     if contract.get("quote_fresh") and midpoint > 0:
         return midpoint, "Fresh Bid/Ask Midpoint"
     last = bot.safe_float(contract.get("last"))
     if contract.get("trade_fresh") and last > 0:
         return last, "Recent Trade (Lower Confidence)"
+    delayed_close = bot.safe_float(contract.get("day_close"))
+    if delayed_close > 0:
+        return delayed_close, "Delayed Session Close (Reference Only)"
     return 0.0, "Unavailable"
 
 
@@ -555,6 +581,7 @@ def calculate_trade_confidence(contract, direction_edge, gamma_state, entry_sour
     entry_quality = {
         "Fresh Bid/Ask Midpoint": 100.0,
         "Recent Trade (Lower Confidence)": 65.0,
+        "Delayed Session Close (Reference Only)": 45.0,
     }.get(entry_source, 0.0)
     spread_quality = 100.0 if contract.get("spread_percent") is not None else 0.0
     components = {
@@ -603,7 +630,6 @@ def _conservative_assessment(
         and direction_edge >= 12.0
     )
     dte = contract.get("dte")
-    theta_points = bot.safe_float((contract.get("score_breakdown") or {}).get("theta"))
     if score < score_requirement and not strong_score_exception:
         reasons.append("WAIT - SCORE TOO LOW")
     if contract.get("delta") is None:
@@ -618,7 +644,7 @@ def _conservative_assessment(
         reasons.append("WAIT - LOW VOLUME")
     if dte is None or dte < 0 or dte > SCORE_MAX_DTE:
         reasons.append("WAIT - DATA INCOMPLETE")
-    if theta_points <= 0 or contract.get("iv") is None:
+    if contract.get("theta") is None or contract.get("iv") is None:
         reasons.append("WAIT - DATA INCOMPLETE")
     if bot.safe_float(contract.get("completeness_percent")) < CONSERVATIVE_MIN_COMPLETENESS:
         reasons.append("WAIT - DATA INCOMPLETE")
@@ -638,14 +664,22 @@ def _conservative_assessment(
             reasons.append("WAIT - SPREAD UNAVAILABLE")
         if any("0DTE cutoff" in reason for reason in contract.get("rejection_reasons") or []):
             reasons.append("WAIT - 0DTE TOO LATE")
-    elif contract.get("spread_percent") is None and score < ORCA_CONSERVATIVE_MIN_SCORE + 5:
+    elif (
+        contract.get("spread_percent") is None
+        and entry_source != "Delayed Session Close (Reference Only)"
+        and score < ORCA_CONSERVATIVE_MIN_SCORE + 5
+    ):
         reasons.append("WAIT - SPREAD UNAVAILABLE")
     if entry <= 0:
         reasons.append("WAITING FOR PRICE CONFIRMATION")
     confidence = calculate_trade_confidence(
         contract, direction_edge, gamma_state, entry_source
     )
-    if confidence["level"] != "HIGH":
+    delayed_reference_allowed = (
+        entry_source == "Delayed Session Close (Reference Only)"
+        and confidence["score"] >= CONSERVATIVE_MEDIUM_CONFIDENCE
+    )
+    if confidence["level"] != "HIGH" and not delayed_reference_allowed:
         reasons.append("WAIT - CONFIDENCE NOT HIGH")
     reasons = list(dict.fromkeys(reasons))
     return {
@@ -1192,6 +1226,7 @@ def _telegram_contract_caption(state):
             f"UNDERLYING: ${_telegram_value(state.get('stock_price'))} | "
             f"ENTRY: {money(state.get('entry_price'))}"
         ),
+        f"ENTRY SOURCE: {state.get('entry_source') or 'N/A'}",
     ]
     edge = state.get("directional_edge")
     if edge not in (None, ""):
@@ -1343,11 +1378,60 @@ def telegram_send_card(state):
     raise RuntimeError(error_text or "Telegram send failed")
 
 
+def _massive_error(response, endpoint):
+    """Keep provider failures actionable without logging credentials."""
+    text = (getattr(response, "text", "") or "").strip().replace("\n", " ")
+    return (
+        f"MASSIVE_HTTP_{getattr(response, 'status_code', 'UNKNOWN')} "
+        f"{endpoint}: {text[:240] or 'empty response'}"
+    )
+
+
+def _massive_rate_limit_delay(response):
+    retry_after = None
+    try:
+        retry_after = float(response.headers.get("Retry-After"))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return max(
+        1.0,
+        min(
+            120.0,
+            retry_after if retry_after is not None
+            else MASSIVE_RATE_LIMIT_BACKOFF_SECONDS,
+        ),
+    )
+
+
 def massive_chain(symbol, direction):
-    """Fetch every page of Massive option snapshots for one contract side."""
+    """Fetch a chain with short caching and explicit rate-limit protection."""
+    global _MASSIVE_BACKOFF_UNTIL, _UNDERLYING_PRICE_BACKOFF_UNTIL
     api_key = bot.env("MASSIVE_API_KEY")
     if not api_key:
         raise RuntimeError("MASSIVE_API_KEY is missing")
+
+    symbol = str(symbol or "").upper().strip()
+    direction = str(direction or "").upper().strip()
+    cache_key = (symbol, direction)
+    now_monotonic = time.monotonic()
+    with _MASSIVE_CHAIN_CACHE_LOCK:
+        cached = _MASSIVE_CHAIN_CACHE.get(cache_key)
+        if (
+            isinstance(cached, dict)
+            and now_monotonic - cached["timestamp"] <= MASSIVE_CHAIN_CACHE_TTL_SECONDS
+        ):
+            print(
+                f"{symbol} {direction} chain source: cache "
+                f"age={now_monotonic - cached['timestamp']:.1f}s"
+            )
+            return list(cached["results"])
+
+    if now_monotonic < _MASSIVE_BACKOFF_UNTIL:
+        remaining = max(0.0, _MASSIVE_BACKOFF_UNTIL - now_monotonic)
+        raise RuntimeError(
+            f"MASSIVE_RATE_LIMIT_BACKOFF: {symbol} {direction}, "
+            f"retry in {remaining:.0f}s"
+        )
 
     contract_type = "call" if direction == "CALL" else "put"
     url = f"{bot.BASE_URL}/v3/snapshot/options/{symbol}"
@@ -1365,7 +1449,20 @@ def massive_chain(symbol, direction):
         seen_urls.add(url)
 
         response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
+        if response.status_code == 429:
+            delay = _massive_rate_limit_delay(response)
+            _MASSIVE_BACKOFF_UNTIL = max(
+                _MASSIVE_BACKOFF_UNTIL, time.monotonic() + delay
+            )
+            _UNDERLYING_PRICE_BACKOFF_UNTIL = max(
+                _UNDERLYING_PRICE_BACKOFF_UNTIL, time.monotonic() + delay
+            )
+            raise RuntimeError(
+                f"MASSIVE_RATE_LIMIT: {symbol} {direction}; "
+                f"retry in {delay:.0f}s"
+            )
+        if not response.ok:
+            raise RuntimeError(_massive_error(response, f"{symbol} {direction}"))
         payload = response.json()
         page = payload.get("results") or []
         if not isinstance(page, list):
@@ -1378,6 +1475,11 @@ def massive_chain(symbol, direction):
         url = str(next_url)
         params = {"apiKey": api_key}
 
+    with _MASSIVE_CHAIN_CACHE_LOCK:
+        _MASSIVE_CHAIN_CACHE[cache_key] = {
+            "timestamp": time.monotonic(),
+            "results": list(results),
+        }
     return results
 
 
@@ -1444,14 +1546,17 @@ def _massive_stock_get(path, api_key, params=None):
 
 def fetch_underlying_price(symbol, call_raw, put_raw):
     """Use a cached/latest minute aggregate, retaining option inference as fallback."""
-    global _UNDERLYING_PRICE_BACKOFF_UNTIL
+    global _UNDERLYING_PRICE_BACKOFF_UNTIL, _MASSIVE_BACKOFF_UNTIL
     symbol = str(symbol or "").upper().strip()
     api_key = bot.env("MASSIVE_API_KEY")
     now_monotonic = time.monotonic()
 
     with _UNDERLYING_PRICE_CACHE_LOCK:
         cached = _UNDERLYING_PRICE_CACHE.get(symbol)
-        backoff_active = now_monotonic < _UNDERLYING_PRICE_BACKOFF_UNTIL
+        backoff_active = (
+            now_monotonic < _UNDERLYING_PRICE_BACKOFF_UNTIL
+            or now_monotonic < _MASSIVE_BACKOFF_UNTIL
+        )
     if cached and now_monotonic - cached["timestamp"] <= UNDERLYING_PRICE_CACHE_TTL_SECONDS:
         print(
             f"{symbol} stock_price_source: cached_minute_aggregate "
@@ -1514,13 +1619,17 @@ def fetch_underlying_price(symbol, call_raw, put_raw):
             print(f"{symbol} minute aggregate underlying price failed: {error}")
             response = getattr(error, "response", None)
             if response is not None and getattr(response, "status_code", None) == 429:
+                delay = _massive_rate_limit_delay(response)
                 with _UNDERLYING_PRICE_CACHE_LOCK:
                     _UNDERLYING_PRICE_BACKOFF_UNTIL = (
-                        time.monotonic() + UNDERLYING_PRICE_BACKOFF_SECONDS
+                        time.monotonic() + delay
+                    )
+                    _MASSIVE_BACKOFF_UNTIL = max(
+                        _MASSIVE_BACKOFF_UNTIL, time.monotonic() + delay
                     )
                 print(
                     f"{symbol} stock price HTTP 429; global backoff "
-                    f"{UNDERLYING_PRICE_BACKOFF_SECONDS:.0f}s"
+                    f"{delay:.0f}s"
                 )
 
     price, _ = bot.infer_underlying_price(call_raw, put_raw)
@@ -1895,6 +2004,7 @@ def create_trade(
             "ask": contract.get("ask"),
             "midpoint": contract.get("midpoint"),
             "last": contract.get("last"),
+            "day_close": contract.get("day_close"),
             "spread_percent": contract.get("spread_percent"),
             "iv": contract.get("iv"),
             "theta": contract.get("theta"),
@@ -2162,6 +2272,12 @@ def _side_diagnostic(
         reasons.append(f"volume {volume:.0f} < {bot.AUTO_SCAN_MIN_VOLUME:.0f}")
     if not gamma_ok:
         reasons.append("Gamma opposed")
+    if not side_stats.get("raw_count"):
+        reasons.insert(0, f"{direction} chain returned no contracts")
+    elif side_stats.get("skipped_identity"):
+        reasons.append(
+            f"{side_stats['skipped_identity']} contracts missing ticker/expiration"
+        )
 
     accepted = score_ok and edge_ok and volume_ok and gamma_ok
     return {
@@ -2190,6 +2306,8 @@ def _side_diagnostic(
         ),
         "candidate_count": side_stats.get("candidate_count", 0),
         "eligible_candidate_count": side_stats.get("eligible_candidate_count", 0),
+        "raw_count": side_stats.get("raw_count", 0),
+        "skipped_identity": side_stats.get("skipped_identity", 0),
         "candidate_scores": side_stats.get("candidate_scores") or [],
         "checks": {
             "eligible_contract": has_eligible_contract,
@@ -2461,8 +2579,8 @@ def scan_symbol_options(symbol):
         _LAST_SCAN_DECISIONS[symbol] = {
             "status": result["status"],
             "preferred_contract": result.get("preferred_contract"),
-            "call_reasons": call_diag.get("wait_reasons") or [call_diag.get("reason")],
-            "put_reasons": put_diag.get("wait_reasons") or [put_diag.get("reason")],
+            "call": _scan_decision_summary(call_diag),
+            "put": _scan_decision_summary(put_diag),
             "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
         }
         return result
@@ -2490,8 +2608,40 @@ def scan_symbol_options(symbol):
         "status": "TRADE",
         "contract": state.get("contract_ticker"),
         "confidence": state.get("trade_confidence"),
+        "direction": direction,
+        "scan_mode": scan_context["scan_mode"],
         "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
     }
+    return result
+
+
+def _scan_decision_summary(diagnostic):
+    """Keep health/log output complete without dumping every candidate row."""
+    return {
+        key: diagnostic.get(key)
+        for key in (
+            "accepted", "contract", "score", "edge", "volume",
+            "required_score", "required_edge", "scan_mode",
+            "raw_count", "candidate_count", "eligible_candidate_count",
+            "reason", "wait_status", "wait_reasons",
+        )
+        if key in diagnostic
+    }
+
+
+def _scan_log_summary(item):
+    """Print a bounded scan summary while retaining full API diagnostics."""
+    result = {
+        "symbol": item.get("symbol"),
+        "accepted": item.get("accepted"),
+        "status": item.get("status"),
+        "direction": item.get("direction"),
+        "contract": item.get("contract"),
+        "error": item.get("error"),
+    }
+    for side in ("call", "put"):
+        diagnostic = item.get(side) or {}
+        result[side] = _scan_decision_summary(diagnostic)
     return result
 
 
@@ -2519,7 +2669,7 @@ def scan_watchlist_once(force=False):
                     "error": str(error),
                 }
             results.append(item)
-            print("🐋 ORCA SCAN:", item)
+            print("🐋 ORCA SCAN:", _scan_log_summary(item))
             bot.time.sleep(0.35)
 
         return {"accepted": True, "checked": len(bot.WATCHLIST), "results": results}
@@ -2637,6 +2787,24 @@ class CanonicalHandler(bot.Handler):
                                  "scanner_thread_running": _thread_status("scanner"),
                                  "monitor_thread_running": _thread_status("monitor"),
                                  "duplicate_thread_start_prevented": _DUPLICATE_THREAD_START_PREVENTED,
+                                  "configuration": {
+                                      "telegram_bot_token_present": bool(
+                                          bot.env("TELEGRAM_BOT_TOKEN")
+                                      ),
+                                      "telegram_chat_id_present": bool(
+                                          bot.env("TELEGRAM_CHAT_ID")
+                                      ),
+                                      "massive_api_key_present": bool(
+                                          bot.env("MASSIVE_API_KEY")
+                                      ),
+                                      "webhook_secret_present": bool(
+                                          bot.env("REEF_WEBHOOK_SECRET")
+                                      ),
+                                      "contract_dte_window": f"0-{SCORE_MAX_DTE}",
+                                      "massive_chain_cache_ttl_seconds": (
+                                          MASSIVE_CHAIN_CACHE_TTL_SECONDS
+                                      ),
+                                  },
                                  "single_process_expected": True})
 
     def do_POST(self):
