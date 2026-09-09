@@ -161,6 +161,7 @@ QUOTE_FRESH_SECONDS = float(os.getenv("MASSIVE_QUOTE_FRESH_SECONDS", "30"))
 TRADE_FRESH_SECONDS = float(os.getenv("MASSIVE_TRADE_FRESH_SECONDS", "90"))
 TELEGRAM_EDIT_ATTEMPTS = max(1, int(os.getenv("TELEGRAM_EDIT_ATTEMPTS", "3")))
 TELEGRAM_EDIT_RETRY_SECONDS = float(os.getenv("TELEGRAM_EDIT_RETRY_SECONDS", "1"))
+TELEGRAM_SEND_ATTEMPTS = max(1, int(os.getenv("TELEGRAM_SEND_ATTEMPTS", "3")))
 _ORIGINAL_RENDER_TRADE_CARD = bot.render_trade_card
 
 # Phase 4 contract-quality defaults. Component maxima total 100 points:
@@ -1136,6 +1137,109 @@ def render_trade_card(state):
     return output
 
 
+def _telegram_value(value, suffix="", decimals=2):
+    """Format an observed contract value without inventing unavailable data."""
+    if value in (None, ""):
+        return "N/A"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return f"{value}{suffix}"
+    return f"{number:.{decimals}f}{suffix}"
+
+
+def _telegram_contract_caption(state):
+    """Describe the exact locked contract that the image represents."""
+    direction = str(state.get("direction") or "N/A").upper()
+    contract = bot.canonical_option_ticker(state.get("contract_ticker") or "")
+    expiration = state.get("expiration") or "N/A"
+    dte = state.get("dte")
+    dte_text = f"{dte}DTE" if dte not in (None, "") else "DTE N/A"
+    money = lambda value: (
+        "N/A" if value in (None, "") else f"${_telegram_value(value)}"
+    )
+    bid = money(state.get("bid"))
+    ask = money(state.get("ask"))
+    iv_raw = _present_number(state.get("iv"))
+    iv = (
+        "N/A" if iv_raw in (None, "")
+        else f"{float(iv_raw) * 100:.2f}%"
+    )
+    lines = [
+        "ORCA WHALE OPTIONS SIGNAL",
+        f"{state.get('symbol', 'N/A')} {direction}",
+        f"CONTRACT: {contract}",
+        f"EXPIRATION: {expiration} ({dte_text})",
+        f"STRIKE: {money(state.get('strike'))}",
+        (
+            "ATTRIBUTES: "
+            f"Delta {_telegram_value(state.get('delta'))} | "
+            f"Volume {_telegram_value(state.get('volume'), '', 0)} | "
+            f"OI {_telegram_value(state.get('open_interest'), '', 0)}"
+        ),
+        (
+            "QUOTE: "
+            f"Bid {bid} | Ask {ask} | Mid {money(state.get('midpoint'))} | "
+            f"Last {money(state.get('last'))}"
+        ),
+        (
+            "QUALITY: "
+            f"Spread {_telegram_value(state.get('spread_percent'), '%')} | "
+            f"IV {iv} | Theta {_telegram_value(state.get('theta'))} | "
+            f"Score {_telegram_value(state.get('score'), '', 1)}/100"
+        ),
+        (
+            f"UNDERLYING: ${_telegram_value(state.get('stock_price'))} | "
+            f"ENTRY: {money(state.get('entry_price'))}"
+        ),
+    ]
+    edge = state.get("directional_edge")
+    if edge not in (None, ""):
+        lines.append(f"DIRECTIONAL EDGE: {_telegram_value(edge, '', 1)}")
+    scan_mode = state.get("scan_mode")
+    if scan_mode:
+        lines.append(
+            f"SCAN MODE: {scan_mode} | "
+            f"REQUIRED SCORE {_telegram_value(state.get('required_score'), '', 1)} | "
+            f"REQUIRED EDGE {_telegram_value(state.get('required_edge'), '', 1)}"
+        )
+    # Telegram captions are limited to 1024 characters. Keep complete lines and
+    # never cut a contract attribute in the middle.
+    caption = "\n".join(lines)
+    return caption[:1024]
+
+
+def _telegram_response_error(response):
+    """Return Telegram's useful API description without exposing credentials."""
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        description = payload.get("description")
+        error_code = payload.get("error_code")
+        if description:
+            return f"Telegram API {error_code or response.status_code}: {description}"
+    text = (response.text or "").strip().replace("\n", " ")
+    return f"Telegram HTTP {response.status_code}: {text[:300] or 'empty response'}"
+
+
+def _telegram_message_id(response):
+    """Validate both HTTP success and Telegram's JSON success flag."""
+    if not response.ok:
+        raise RuntimeError(_telegram_response_error(response))
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise RuntimeError("Telegram returned invalid JSON") from error
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise RuntimeError(_telegram_response_error(response))
+    message_id = (payload.get("result") or {}).get("message_id")
+    if message_id is None:
+        raise RuntimeError("Telegram response did not contain message_id")
+    return message_id
+
+
 def _render_unique_card(state):
     """Render the canonical card into a safely unique temporary image."""
     unique = Path(bot.__file__).with_name(
@@ -1167,11 +1271,22 @@ def telegram_edit_card_retry(message_id, state, attempts=TELEGRAM_EDIT_ATTEMPTS)
                 response = requests.post(
                     f"https://api.telegram.org/bot{token}/editMessageMedia",
                     data={"chat_id": chat_id, "message_id": str(message_id),
-                          "media": json.dumps({"type": "photo", "media": "attach://photo"})},
+                          "media": json.dumps({
+                              "type": "photo",
+                              "media": "attach://photo",
+                              "caption": _telegram_contract_caption(state),
+                          })},
                     files={"photo": ("reef_options.png", image, "image/png")}, timeout=20)
             if response.status_code == 400 and "message is not modified" in response.text.lower():
                 return True, None
-            response.raise_for_status()
+            if not response.ok:
+                raise RuntimeError(_telegram_response_error(response))
+            try:
+                payload = response.json()
+            except ValueError as error:
+                raise RuntimeError("Telegram returned invalid JSON") from error
+            if payload.get("ok") is not True:
+                raise RuntimeError(_telegram_response_error(response))
             return True, None
         except Exception as error:
             error_text = str(error)
@@ -1188,24 +1303,44 @@ def telegram_edit_card_retry(message_id, state, attempts=TELEGRAM_EDIT_ATTEMPTS)
 
 
 def telegram_send_card(state):
-    """Initial card send also owns a unique temporary image."""
+    """Send the exact contract card and retry transient Telegram failures."""
     token, chat_id = bot.env("TELEGRAM_BOT_TOKEN"), bot.env("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         raise RuntimeError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
-    image_path = _render_unique_card(state)
-    try:
-        with image_path.open("rb") as image:
-            response = requests.post(
-                f"https://api.telegram.org/bot{token}/sendPhoto",
-                data={"chat_id": chat_id},
-                files={"photo": ("reef_options.png", image, "image/png")}, timeout=20)
-        response.raise_for_status()
-        return response.json()["result"]["message_id"]
-    finally:
+    error_text = None
+    for attempt in range(1, TELEGRAM_SEND_ATTEMPTS + 1):
+        image_path = None
         try:
-            image_path.unlink()
-        except OSError:
-            pass
+            image_path = _render_unique_card(state)
+            with image_path.open("rb") as image:
+                response = requests.post(
+                    f"https://api.telegram.org/bot{token}/sendPhoto",
+                    data={
+                        "chat_id": chat_id,
+                        "caption": _telegram_contract_caption(state),
+                    },
+                    files={"photo": ("reef_options.png", image, "image/png")},
+                    timeout=20,
+                )
+            return _telegram_message_id(response)
+        except Exception as error:
+            error_text = str(error)
+            print(f"Telegram send attempt {attempt} failed:", error_text)
+            retryable = (
+                isinstance(error, requests.RequestException)
+                or "Telegram HTTP 429" in error_text
+                or "Telegram HTTP 5" in error_text
+            )
+            if attempt >= TELEGRAM_SEND_ATTEMPTS or not retryable:
+                raise RuntimeError(error_text) from error
+            time.sleep(TELEGRAM_EDIT_RETRY_SECONDS)
+        finally:
+            if image_path:
+                try:
+                    image_path.unlink()
+                except OSError:
+                    pass
+    raise RuntimeError(error_text or "Telegram send failed")
 
 
 def massive_chain(symbol, direction):
@@ -1685,7 +1820,8 @@ def nearest_expiration(contracts):
 
 def create_trade(
     symbol, direction, stock_price, contract=None, gamma_info=None,
-    trade_confidence=None, gamma_direction=None,
+    trade_confidence=None, gamma_direction=None, directional_edge=None,
+    scan_mode=None, required_score=None, required_edge=None,
 ):
     """Lock and open the exact contract that qualified during the scan."""
     symbol = str(symbol or "").upper().strip()
@@ -1752,6 +1888,20 @@ def create_trade(
             "trade_confidence": (trade_confidence or {}).get("level", "N/A"),
             "trade_confidence_score": (trade_confidence or {}).get("score"),
             "trade_confidence_components": (trade_confidence or {}).get("components", {}),
+            "delta": contract.get("delta"),
+            "volume": contract.get("volume"),
+            "open_interest": contract.get("open_interest"),
+            "bid": contract.get("bid"),
+            "ask": contract.get("ask"),
+            "midpoint": contract.get("midpoint"),
+            "last": contract.get("last"),
+            "spread_percent": contract.get("spread_percent"),
+            "iv": contract.get("iv"),
+            "theta": contract.get("theta"),
+            "directional_edge": directional_edge,
+            "scan_mode": scan_mode,
+            "required_score": required_score,
+            "required_edge": required_edge,
             "gamma_direction_state": gamma_direction or gamma_direction_state(
                 direction, stock_price, gamma_info
             ),
@@ -2324,6 +2474,12 @@ def scan_symbol_options(symbol):
         symbol, direction, stock_price, contract=contract, gamma_info=gamma_info,
         trade_confidence=(assessment or {}).get("trade_confidence"),
         gamma_direction=(assessment or {}).get("gamma_direction_state"),
+        directional_edge=(
+            call_diag["edge"] if direction == "CALL" else put_diag["edge"]
+        ),
+        scan_mode=scan_context["scan_mode"],
+        required_score=scan_context["required_score"],
+        required_edge=scan_context["required_edge"],
     )
     result["direction"] = direction
     result["contract"] = state.get("contract_ticker")
