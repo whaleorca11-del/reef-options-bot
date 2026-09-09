@@ -1183,65 +1183,8 @@ def _telegram_value(value, suffix="", decimals=2):
 
 
 def _telegram_contract_caption(state):
-    """Describe the exact locked contract that the image represents."""
-    direction = str(state.get("direction") or "N/A").upper()
-    contract = bot.canonical_option_ticker(state.get("contract_ticker") or "")
-    expiration = state.get("expiration") or "N/A"
-    dte = state.get("dte")
-    dte_text = f"{dte}DTE" if dte not in (None, "") else "DTE N/A"
-    money = lambda value: (
-        "N/A" if value in (None, "") else f"${_telegram_value(value)}"
-    )
-    bid = money(state.get("bid"))
-    ask = money(state.get("ask"))
-    iv_raw = _present_number(state.get("iv"))
-    iv = (
-        "N/A" if iv_raw in (None, "")
-        else f"{float(iv_raw) * 100:.2f}%"
-    )
-    lines = [
-        "ORCA WHALE OPTIONS SIGNAL",
-        f"{state.get('symbol', 'N/A')} {direction}",
-        f"CONTRACT: {contract}",
-        f"EXPIRATION: {expiration} ({dte_text})",
-        f"STRIKE: {money(state.get('strike'))}",
-        (
-            "ATTRIBUTES: "
-            f"Delta {_telegram_value(state.get('delta'))} | "
-            f"Volume {_telegram_value(state.get('volume'), '', 0)} | "
-            f"OI {_telegram_value(state.get('open_interest'), '', 0)}"
-        ),
-        (
-            "QUOTE: "
-            f"Bid {bid} | Ask {ask} | Mid {money(state.get('midpoint'))} | "
-            f"Last {money(state.get('last'))}"
-        ),
-        (
-            "QUALITY: "
-            f"Spread {_telegram_value(state.get('spread_percent'), '%')} | "
-            f"IV {iv} | Theta {_telegram_value(state.get('theta'))} | "
-            f"Score {_telegram_value(state.get('score'), '', 1)}/100"
-        ),
-        (
-            f"UNDERLYING: ${_telegram_value(state.get('stock_price'))} | "
-            f"ENTRY: {money(state.get('entry_price'))}"
-        ),
-        f"ENTRY SOURCE: {state.get('entry_source') or 'N/A'}",
-    ]
-    edge = state.get("directional_edge")
-    if edge not in (None, ""):
-        lines.append(f"DIRECTIONAL EDGE: {_telegram_value(edge, '', 1)}")
-    scan_mode = state.get("scan_mode")
-    if scan_mode:
-        lines.append(
-            f"SCAN MODE: {scan_mode} | "
-            f"REQUIRED SCORE {_telegram_value(state.get('required_score'), '', 1)} | "
-            f"REQUIRED EDGE {_telegram_value(state.get('required_edge'), '', 1)}"
-        )
-    # Telegram captions are limited to 1024 characters. Keep complete lines and
-    # never cut a contract attribute in the middle.
-    caption = "\n".join(lines)
-    return caption[:1024]
+    """Keep internal contract attributes out of the visible Telegram caption."""
+    return ""
 
 
 def _telegram_response_error(response):
@@ -1352,7 +1295,6 @@ def telegram_send_card(state):
                     f"https://api.telegram.org/bot{token}/sendPhoto",
                     data={
                         "chat_id": chat_id,
-                        "caption": _telegram_contract_caption(state),
                     },
                     files={"photo": ("reef_options.png", image, "image/png")},
                     timeout=20,
