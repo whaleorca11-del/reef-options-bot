@@ -1,0 +1,1 @@
+- [Option entry freshness](option-entry-freshness.md) — never open a position from delayed option prices; wait for a live quote.
