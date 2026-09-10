@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: reef-options-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: MASSIVE_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: REEF_WEBHOOK_SECRET
+        sync: false
+      - key: AUTO_SCAN_ENABLED
+        value: "true"
