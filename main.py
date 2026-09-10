@@ -2717,6 +2717,79 @@ def parse_force(value):
     return value
 
 
+def _tradingview_symbol(value):
+    """Normalize TradingView's optional exchange prefix for stock signals."""
+    raw = str(value or "").upper().strip()
+    if ":" in raw:
+        raw = raw.rsplit(":", 1)[-1]
+    return raw.replace(" ", "")
+
+
+def _tradingview_signal_type(payload):
+    """Return the explicit TradingView event name, if one was supplied."""
+    for key in ("signal_type", "event", "signal", "type", "direction"):
+        value = str(payload.get(key) or "").upper().strip()
+        if value:
+            return value.replace("-", "_").replace(" ", "_")
+    return ""
+
+
+def _tradingview_direction(payload):
+    """Extract CALL/PUT from either the direct field or an event name."""
+    direct = str(payload.get("direction") or "").upper().strip()
+    if direct in ("CALL", "PUT"):
+        return direct
+    event = _tradingview_signal_type(payload)
+    if "CALL" in event:
+        return "CALL"
+    if "PUT" in event:
+        return "PUT"
+    return ""
+
+
+def _normalize_tradingview_payload(path, payload):
+    """
+    Normalize TradingView JSON without weakening the webhook contract.
+
+    TradingView commonly sends NASDAQ:AAPL for stock charts and OPRA:... for
+    option charts. The historical handler already owns the actual trade and
+    quote logic, so this adapter only maps those aliases to its stable fields.
+    """
+    normalized = dict(payload)
+    normalized["source"] = str(payload.get("source") or "tradingview").strip()
+
+    if path == "/signal":
+        symbol = _tradingview_symbol(
+            payload.get("ticker") or payload.get("symbol")
+        )
+        direction = _tradingview_direction(payload)
+        signal_type = _tradingview_signal_type(payload)
+        if symbol:
+            normalized["ticker"] = symbol
+        if direction:
+            normalized["direction"] = direction
+        if signal_type:
+            normalized["signal_type"] = signal_type
+        if payload.get("price") is None and payload.get("close") is not None:
+            normalized["price"] = payload.get("close")
+        if payload.get("interval") is None and payload.get("timeframe") is not None:
+            normalized["interval"] = payload.get("timeframe")
+
+    elif path == "/option-price":
+        ticker = str(
+            payload.get("ticker")
+            or payload.get("option_ticker")
+            or payload.get("symbol")
+            or ""
+        ).strip()
+        if ticker:
+            normalized["ticker"] = ticker
+        if payload.get("price") is None and payload.get("close") is not None:
+            normalized["price"] = payload.get("close")
+
+    return normalized
+
+
 def _start_thread_once(kind, target, name):
     """Prevent duplicate in-process loops when startup is invoked twice."""
     global _DUPLICATE_THREAD_START_PREVENTED
@@ -2863,9 +2936,36 @@ class CanonicalHandler(bot.Handler):
                 if str(payload.get("secret", "")) != secret:
                     self.json_response(401, {"error": "invalid secret"})
                     return
+                payload = _normalize_tradingview_payload(path, payload)
+                if path == "/signal":
+                    signal_type = str(payload.get("signal_type") or "").upper()
+                    if signal_type.startswith("EARLY_") or signal_type.startswith(
+                        "FAST_EARLY_"
+                    ):
+                        self.json_response(202, {
+                            "accepted": True,
+                            "ignored": "TradingView preparation signal",
+                            "signal_type": signal_type,
+                            "ticker": payload.get("ticker"),
+                        })
+                        return
+                    if signal_type.startswith("EXIT_"):
+                        self.json_response(202, {
+                            "accepted": True,
+                            "ignored": "TradingView exit signal is informational",
+                            "signal_type": signal_type,
+                            "ticker": payload.get("ticker"),
+                        })
+                        return
                 # The historical handler owns the route implementation. Restore
                 # the authenticated body so it can parse it normally.
-                self.rfile = io.BytesIO(raw_bytes)
+                normalized_bytes = json.dumps(
+                    payload, ensure_ascii=False
+                ).encode("utf-8")
+                self.headers.replace_header(
+                    "Content-Length", str(len(normalized_bytes))
+                )
+                self.rfile = io.BytesIO(normalized_bytes)
             return super().do_POST()
 
         length = int(self.headers.get("Content-Length", "0") or "0")
