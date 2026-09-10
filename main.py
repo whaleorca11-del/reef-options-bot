@@ -221,6 +221,9 @@ ORCA_MIN_DIRECTION_EDGE = max(
 CONSERVATIVE_MIN_COMPLETENESS = 83.0
 CONSERVATIVE_HIGH_CONFIDENCE = 82.0
 CONSERVATIVE_MEDIUM_CONFIDENCE = 65.0
+REQUIRE_FRESH_OPTION_ENTRY = os.getenv(
+    "REQUIRE_FRESH_OPTION_ENTRY", "1"
+).strip().lower() not in ("0", "false", "no")
 
 
 def _present_number(value):
@@ -546,7 +549,7 @@ def _side_flow_stats(contracts):
 
 
 def choose_initial_price(contract):
-    """Prefer fresh prices, then expose delayed session close as a reference."""
+    """Prefer live prices and retain delayed close only for diagnostics."""
     midpoint = bot.safe_float(contract.get("midpoint"))
     if contract.get("quote_fresh") and midpoint > 0:
         return midpoint, "Fresh Bid/Ask Midpoint"
@@ -672,6 +675,8 @@ def _conservative_assessment(
         reasons.append("WAIT - SPREAD UNAVAILABLE")
     if entry <= 0:
         reasons.append("WAITING FOR PRICE CONFIRMATION")
+    if REQUIRE_FRESH_OPTION_ENTRY and entry_source != "Fresh Bid/Ask Midpoint":
+        reasons.append("WAIT - LIVE OPTION PRICE REQUIRED")
     confidence = calculate_trade_confidence(
         contract, direction_edge, gamma_state, entry_source
     )
@@ -859,6 +864,88 @@ def _newest_timestamp(values):
     values = [_unix_seconds(value) for value in values]
     values = [value for value in values if value is not None]
     return max(values) if values else None
+
+
+def _option_reference_mark(raw):
+    """Return the best available mark for conservative parity inference."""
+    quote = raw.get("last_quote", {}) or {}
+    trade = raw.get("last_trade", {}) or {}
+    day = raw.get("day", {}) or {}
+    midpoint = _present_number(quote.get("midpoint"))
+    if midpoint is not None and midpoint > 0:
+        return midpoint
+    bid = _present_number(
+        quote.get("bid") if quote.get("bid") is not None else quote.get("bid_price")
+    )
+    ask = _present_number(
+        quote.get("ask") if quote.get("ask") is not None else quote.get("ask_price")
+    )
+    if bid is not None and ask is not None and bid > 0 and ask >= bid:
+        return (bid + ask) / 2.0
+    for value in (
+        ask,
+        bid,
+        _present_number(trade.get("price")),
+        _present_number(day.get("close")),
+        _present_number(day.get("open")),
+    ):
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _infer_underlying_from_put_call_parity(call_raw, put_raw):
+    """Infer spot from paired same-strike options when the stock endpoint is limited."""
+    puts_by_key = {}
+    for raw in put_raw or []:
+        details = raw.get("details", {}) or {}
+        expiration = details.get("expiration_date")
+        strike = _present_number(details.get("strike_price"))
+        mark = _option_reference_mark(raw)
+        if expiration and strike is not None and mark is not None:
+            puts_by_key[(str(expiration), round(strike, 4))] = mark
+
+    estimates = []
+    for raw in call_raw or []:
+        details = raw.get("details", {}) or {}
+        expiration = details.get("expiration_date")
+        strike = _present_number(details.get("strike_price"))
+        call_mark = _option_reference_mark(raw)
+        put_mark = puts_by_key.get(
+            (str(expiration), round(strike, 4))
+        ) if expiration and strike is not None else None
+        if (
+            call_mark is None
+            or put_mark is None
+            or strike is None
+            or call_mark <= 0
+            or put_mark <= 0
+            or strike <= 0
+        ):
+            continue
+        estimate = call_mark - put_mark + strike
+        # Reject obviously stale/mismatched pairs before taking the median.
+        if strike * 0.50 <= estimate <= strike * 1.50:
+            estimates.append(estimate)
+
+    if len(estimates) < 5:
+        return 0.0
+    estimates.sort()
+    middle = len(estimates) // 2
+    if len(estimates) % 2:
+        return estimates[middle]
+    return (estimates[middle - 1] + estimates[middle]) / 2.0
+
+
+def _infer_underlying_with_parity(call_raw, put_raw):
+    """Use the original inference first, then paired option parity as a fallback."""
+    price, source = bot.infer_underlying_price(call_raw, put_raw)
+    if price > 0:
+        return price, source
+    parity_price = _infer_underlying_from_put_call_parity(call_raw, put_raw)
+    if parity_price > 0:
+        return parity_price, "options_parity_inference"
+    return 0.0, "options_inference"
 
 
 def _snapshot_data(snapshot):
@@ -1508,12 +1595,12 @@ def fetch_underlying_price(symbol, call_raw, put_raw):
 
     if backoff_active:
         print(f"{symbol} stock price request skipped during global 429 backoff")
-        price, _ = bot.infer_underlying_price(call_raw, put_raw)
+        price, source = _infer_underlying_with_parity(call_raw, put_raw)
         print(
-            f"{symbol} stock_price_source: options_inference"
+            f"{symbol} stock_price_source: {source}"
             f"{f' price={price:.4f}' if price > 0 else ' unavailable'}"
         )
-        return price, "options_inference"
+        return price, source
 
     if api_key:
         try:
@@ -1574,12 +1661,12 @@ def fetch_underlying_price(symbol, call_raw, put_raw):
                     f"{delay:.0f}s"
                 )
 
-    price, _ = bot.infer_underlying_price(call_raw, put_raw)
+    price, source = _infer_underlying_with_parity(call_raw, put_raw)
     if price > 0:
-        print(f"{symbol} stock_price_source: options_inference price={price:.4f}")
-        return price, "options_inference"
-    print(f"{symbol} stock_price_source: options_inference unavailable")
-    return price, "options_inference"
+        print(f"{symbol} stock_price_source: {source} price={price:.4f}")
+        return price, source
+    print(f"{symbol} stock_price_source: {source} unavailable")
+    return price, source
 
 
 def _gamma_t_years(expiration, now):
@@ -1877,6 +1964,8 @@ def create_trade(
     """Lock and open the exact contract that qualified during the scan."""
     symbol = str(symbol or "").upper().strip()
     direction = str(direction or "").upper().strip()
+    if bot.safe_float(stock_price) <= 0:
+        raise RuntimeError("Underlying price unavailable; refusing to lock a contract")
     if contract is None:
         # Manual /signal compatibility: select once through the canonical,
         # fully-paginated path and calculate Gamma from that same full universe.
