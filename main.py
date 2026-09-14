@@ -123,6 +123,38 @@ def _save_durable_trade_store(store):
             pass
 
 
+def _trade_expiration_date(trade):
+    """Return a trade's contract expiration date when it is safely parseable."""
+    expiration = str((trade or {}).get("expiration") or "").strip()
+    if not expiration:
+        return None
+    try:
+        return bot.datetime.strptime(expiration, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _expire_trade_if_needed(store, symbol, trade, now=None):
+    """Release an old contract without deleting its historical trade record."""
+    if not isinstance(trade, dict) or trade.get("status") not in (
+        "active", "recovery_required"
+    ):
+        return False
+    now = now or bot.now_new_york()
+    expiration = _trade_expiration_date(trade)
+    if expiration is None or expiration >= now.date():
+        return False
+    trade.update(
+        status="expired",
+        closed_at=now.isoformat(timespec="seconds"),
+        close_reason="EXPIRED_CONTRACT",
+        recovery_note="Contract expiration passed; released for a new signal",
+    )
+    store.setdefault("trades", {})[symbol] = trade
+    _update_paper_trade(store, trade, int(trade.get("achieved", 0)))
+    return True
+
+
 def restore_durable_trade_state():
     """Classify crash leftovers before threads are allowed to create new trades."""
     global _RESTORED_ACTIVE_TRADE_COUNT, _RECOVERY_REQUIRED_COUNT
@@ -131,10 +163,14 @@ def restore_durable_trade_state():
         changed = False
         active = 0
         required = 0
+        now = bot.now_new_york()
         for symbol, trade in list(store["trades"].items()):
             if not isinstance(trade, dict):
                 raise TradeStateCorruptionError(f"invalid trade record for {symbol}")
             status = trade.get("status")
+            if _expire_trade_if_needed(store, symbol, trade, now):
+                changed = True
+                continue
             if status == "active" and trade.get("contract_ticker") and trade.get("message_id"):
                 active += 1
             elif status == "opening":
@@ -2359,6 +2395,9 @@ def scan_symbol_options(symbol):
     with bot.TRADE_STATE_LOCK:
         store = bot._load_trade_store()
         existing = (store.get("trades") or {}).get(symbol)
+        if _expire_trade_if_needed(store, symbol, existing):
+            bot._save_trade_store(store)
+            existing = None
         pending_candidate = (store.get("pending_candidates") or {}).get(symbol)
         has_active_trade = isinstance(existing, dict) and existing.get("status") in (
             "opening",
