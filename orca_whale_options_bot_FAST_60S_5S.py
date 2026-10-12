@@ -4,7 +4,7 @@ import os
 import re
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 # ============================================================
 # REEF ONE FILE BOT
-# TradingView -> Python -> Massive -> Telegram
+# ORCA score/Gamma contract selection -> options provider -> Telegram
 # + Massive option-contract tracking -> targets / stop loss
 # + CONTRACT LOCK: one active contract per stock; duplicate stock signals are ignored
 # ============================================================
@@ -30,9 +30,9 @@ STATE_FILE = Path(__file__).with_name("reef_trade_state.json")
 # HARD LOCK: prevents two simultaneous TradingView requests from opening
 # two contracts for the same stock before state is saved.
 TRADE_STATE_LOCK = threading.RLock()
-AUTO_MONITOR_SECONDS = int(os.getenv("AUTO_MONITOR_SECONDS", "5"))
+AUTO_MONITOR_SECONDS = int(os.getenv("AUTO_MONITOR_SECONDS", "3600"))
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "1").strip().lower() not in ("0", "false", "no")
-AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "60"))
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "3600"))
 AUTO_SCAN_MIN_SCORE = float(os.getenv("AUTO_SCAN_MIN_SCORE", "78"))
 AUTO_SCAN_MIN_EDGE = float(os.getenv("AUTO_SCAN_MIN_EDGE", "3"))
 AUTO_SCAN_MIN_VOLUME = float(os.getenv("AUTO_SCAN_MIN_VOLUME", "50"))
@@ -43,9 +43,11 @@ GAMMA_RISK_FREE_RATE = float(os.getenv("GAMMA_RISK_FREE_RATE", "0.043"))
 GAMMA_FLIP_BUFFER_PCT = float(os.getenv("GAMMA_FLIP_BUFFER_PCT", "0.10"))
 NEW_YORK_TZ = ZoneInfo("America/New_York")
 
+EXCLUDED_SYMBOLS = frozenset({"CVX", "XOM"})
+
 WATCHLIST = [
-    "AAPL", "MSFT", "NVDA", "META", "AMZN", "TSLA", "AMD", "GOOGL",
-    "PEP", "MSTR", "PLTR", "MU", "AVGO", "JNJ", "PG", "PANW", "IBM", "MDB",
+    "AAPL", "AMD", "AMZN", "GOOGL", "MU", "IBM", "META", "TSLA",
+    "NVDA", "MSFT", "PLTR", "GOOG", "GLW", "CSCO", "INTC",
 ]
 
 COMPANY_NAMES = {
@@ -57,16 +59,17 @@ COMPANY_NAMES = {
     "TSLA": "Tesla",
     "AMD": "Advanced Micro Devices",
     "GOOGL": "Alphabet",
-    "PEP": "PepsiCo",
     "MSTR": "Strategy",
     "PLTR": "Palantir",
     "MU": "Micron Technology",
     "AVGO": "Broadcom",
-    "JNJ": "Johnson & Johnson",
-    "PG": "Procter & Gamble",
-    "PANW": "Palo Alto Networks",
     "IBM": "IBM",
-    "MDB": "MongoDB",
+    "GOOG": "Alphabet",
+    "GLW": "Corning",
+    "CSCO": "Cisco Systems",
+    "INTC": "Intel",
+    "CVX": "Chevron",
+    "XOM": "Exxon Mobil",
 }
 
 
@@ -79,16 +82,17 @@ COMPANY_LOGO_DOMAINS = {
     "TSLA": "tesla.com",
     "AMD": "amd.com",
     "GOOGL": "google.com",
-    "PEP": "pepsico.com",
     "MSTR": "strategy.com",
     "PLTR": "palantir.com",
     "MU": "micron.com",
     "AVGO": "broadcom.com",
-    "JNJ": "jnj.com",
-    "PG": "pg.com",
-    "PANW": "paloaltonetworks.com",
     "IBM": "ibm.com",
-    "MDB": "mongodb.com",
+    "GOOG": "google.com",
+    "GLW": "corning.com",
+    "CSCO": "cisco.com",
+    "INTC": "intel.com",
+    "CVX": "chevron.com",
+    "XOM": "corporate.exxonmobil.com",
 }
 
 
@@ -938,19 +942,21 @@ def monitor_active_trades_once():
     store = _load_trade_store()
     trades = store.get("trades", {})
 
-    active_symbols = [
-        symbol
+    active_trades = [
+        (
+            str(trade.get("symbol") or symbol.split("::", 1)[0]).upper().strip(),
+            trade,
+        )
         for symbol, trade in trades.items()
         if isinstance(trade, dict) and trade.get("status") == "active"
     ]
 
-    if not active_symbols:
+    if not active_trades:
         return {"accepted": True, "ignored": "no active trades"}
 
     results = []
 
-    for symbol in active_symbols:
-        trade = trades.get(symbol, {})
+    for symbol, trade in active_trades:
         contract = str(trade.get("contract_ticker", "")).strip()
 
         if not contract:
@@ -990,7 +996,7 @@ def monitor_active_trades_once():
 
     return {
         "accepted": True,
-        "active_checked": len(active_symbols),
+        "active_checked": len(active_trades),
         "results": results,
     }
 
@@ -1146,14 +1152,18 @@ def _update_option_price_locked(option_ticker, option_price):
     incoming = canonical_option_ticker(option_ticker)
 
     matched_symbol = None
+    matched_key = None
     state = None
 
-    for symbol, trade in trades.items():
+    for trade_key, trade in trades.items():
         if not isinstance(trade, dict) or trade.get("status") != "active":
             continue
         expected = canonical_option_ticker(trade.get("contract_ticker", ""))
         if incoming == expected:
-            matched_symbol = symbol
+            matched_key = trade_key
+            matched_symbol = str(
+                trade.get("symbol") or trade_key.split("::", 1)[0]
+            ).upper().strip()
             state = trade
             break
 
@@ -1194,7 +1204,7 @@ def _update_option_price_locked(option_ticker, option_price):
             state["closed_at"] = now_new_york().isoformat(timespec="seconds")
             state["close_reason"] = "ALL_TARGETS"
 
-    trades[matched_symbol] = state
+    trades[matched_key] = state
     _save_trade_store(store)
 
     # IMPORTANT V10 FIX:
@@ -1442,12 +1452,111 @@ def _direction_strength(side, other):
     return round(strength, 2)
 
 
-def market_is_open_now():
-    now = now_new_york()
-    if now.weekday() >= 5:
+def _observed_fixed_holiday(year, month, day):
+    holiday = date(year, month, day)
+    if holiday.weekday() == 5:
+        return holiday - timedelta(days=1)
+    if holiday.weekday() == 6:
+        return holiday + timedelta(days=1)
+    return holiday
+
+
+def _nth_weekday_of_month(year, month, weekday, occurrence):
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (occurrence - 1))
+
+
+def _last_weekday_of_month(year, month, weekday):
+    if month == 12:
+        last = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _easter_sunday(year):
+    """Return Western Easter Sunday using the Gregorian computus."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _market_holidays(year):
+    """Return recurring NYSE full-day closures that may affect this year."""
+    holidays = set()
+    # Include adjacent calendar years to catch observed dates that cross Dec/Jan.
+    for holiday_year in range(year - 1, year + 2):
+        new_year = date(holiday_year, 1, 1)
+        # NYSE does not observe New Year's Day when it falls on Saturday.
+        if new_year.weekday() == 6:
+            holidays.add(new_year + timedelta(days=1))
+        elif new_year.weekday() != 5:
+            holidays.add(new_year)
+
+        holidays.update(
+            {
+                _nth_weekday_of_month(holiday_year, 1, 0, 3),  # Martin Luther King Jr. Day
+                _nth_weekday_of_month(holiday_year, 2, 0, 3),  # Washington's Birthday
+                _easter_sunday(holiday_year) - timedelta(days=2),  # Good Friday
+                _last_weekday_of_month(holiday_year, 5, 0),  # Memorial Day
+                _observed_fixed_holiday(holiday_year, 6, 19),  # Juneteenth
+                _observed_fixed_holiday(holiday_year, 7, 4),  # Independence Day
+                _nth_weekday_of_month(holiday_year, 9, 0, 1),  # Labor Day
+                _nth_weekday_of_month(holiday_year, 11, 3, 4),  # Thanksgiving
+                _observed_fixed_holiday(holiday_year, 12, 25),  # Christmas
+            }
+        )
+    return holidays
+
+
+def _market_early_closes(year):
+    """Return recurring NYSE 1 p.m. early-close dates around the requested year."""
+    early_closes = set()
+    holidays = _market_holidays(year)
+    for holiday_year in range(year - 1, year + 2):
+        thanksgiving = _nth_weekday_of_month(holiday_year, 11, 3, 4)
+        early_closes.add(thanksgiving + timedelta(days=1))
+
+        july_third = date(holiday_year, 7, 3)
+        if july_third.weekday() < 5:
+            early_closes.add(july_third)
+
+        christmas_eve = date(holiday_year, 12, 24)
+        if christmas_eve.weekday() < 5:
+            early_closes.add(christmas_eve)
+
+    return early_closes - holidays
+
+
+def market_is_open_now(now=None):
+    """Return whether the NYSE regular session is open at the given New York time."""
+    now = now or now_new_york()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=NEW_YORK_TZ)
+    else:
+        now = now.astimezone(NEW_YORK_TZ)
+
+    trading_date = now.date()
+    if now.weekday() >= 5 or trading_date in _market_holidays(trading_date.year):
         return False
+
     mins = now.hour * 60 + now.minute
-    return 570 <= mins < 960
+    close_minute = (
+        13 * 60
+        if trading_date in _market_early_closes(trading_date.year)
+        else 16 * 60
+    )
+    return 9 * 60 + 30 <= mins < close_minute
 
 
 
@@ -1757,9 +1866,18 @@ def start_auto_scanner():
 
 
 def main():
+    data_provider = env("DATA_PROVIDER").lower()
+    if data_provider in ("tradier", "tradier_live"):
+        provider_key = "TRADIER_TOKEN"
+    elif data_provider in ("thetadata", "theta", "thetadata_live"):
+        provider_key = "THETADATA_API_KEY"
+    elif data_provider in ("marketdata", "marketdata_app", "marketdata_live"):
+        provider_key = "MARKETDATA_API_KEY"
+    else:
+        provider_key = "MASSIVE_API_KEY"
     missing = [
         name for name in
-        ("MASSIVE_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+        (provider_key, "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
         if not env(name)
     ]
 
@@ -1772,11 +1890,22 @@ def main():
     print("=" * 60)
     print(f"Local URL: http://127.0.0.1:{PORT}")
     print(f"Health:    http://127.0.0.1:{PORT}/health")
-    print(f"Signal:    POST /signal")
+    print("Signals:  ", globals().get("ENTRY_SIGNAL_DESCRIPTION", "ORCA score/Gamma contract qualification (Ichimoku manual)"))
     print(f"Option:    POST /option-price")
-    print(f"Monitor:   POST /monitor-tick")
+    monitoring_enabled = env("AUTO_MONITOR_ENABLED").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    print(
+        "Monitor:   POST /monitor-tick"
+        if monitoring_enabled
+        else "Monitor:   disabled"
+    )
     print()
-    print("✅ ORCA جاهز: ماسح عقود مستقل + Massive لاختيار ومتابعة العقد")
+    print(
+        "✅ ORCA جاهز: ماسح عقود مستقل + "
+        f"{data_provider or 'massive'} "
+        + ("لاختيار ومتابعة العقد" if monitoring_enabled else "لاختيار العقود فقط")
+    )
     print("لإيقافه: Ctrl + C")
     print()
 

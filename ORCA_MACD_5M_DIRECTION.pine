@@ -1,0 +1,29 @@
+//@version=6
+indicator("ORCA MACD Direction 120/180/40 — 5m", overlay=false)
+// Same formula as the original CM_Ult_MacD_MTF:
+// EMA(close, 120) - EMA(close, 180); signal = SMA(MACD, 40).
+webhookSecret = input.string("", "Webhook secret — use your existing ORCA secret")
+sendHeartbeat = input.bool(false, "Send closed-candle values to ORCA")
+
+if not timeframe.isminutes or timeframe.multiplier != 5
+    runtime.error("Use a 5-minute chart. Enable the same extended-hours session as your reference chart.")
+
+macdLine = ta.ema(close, 120) - ta.ema(close, 180)
+signalLine = ta.sma(macdLine, 40)
+histogram = macdLine - signalLine
+barColor = histogram > 0 ? color.green : histogram < 0 ? color.red : color.gray
+plot(histogram, "Histogram: positive CALL / negative PUT", color=barColor, style=plot.style_histogram)
+hline(0, "Zero", color=color.gray)
+
+escapeJson(string value) =>
+    str.replace_all(str.replace_all(str.replace_all(str.replace_all(value, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n"), "\r", "\\r")
+
+numberJson(float value) =>
+    str.tostring(value, "#.############")
+
+if sendHeartbeat and webhookSecret == ""
+    runtime.error("Set the existing ORCA webhook secret before enabling alerts.")
+
+if barstate.isconfirmed and sendHeartbeat and not na(signalLine)
+    body = "{\"secret\":\"" + escapeJson(webhookSecret) + "\",\"ticker\":\"" + syminfo.ticker + "\",\"signal_type\":\"MACD_5M\",\"timeframe\":\"5\",\"fast\":120,\"slow\":180,\"signal_length\":40,\"signal_average\":\"SMA\",\"bar_closed\":true,\"bar_time_ms\":" + str.tostring(time) + ",\"bar_close_time_ms\":" + str.tostring(time_close) + ",\"macd\":" + numberJson(macdLine) + ",\"signal\":" + numberJson(signalLine) + ",\"histogram\":" + numberJson(histogram) + ",\"price\":" + numberJson(close) + "}"
+    alert(body, alert.freq_once_per_bar_close)
