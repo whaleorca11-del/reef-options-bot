@@ -7,6 +7,7 @@ scanner/selection behaviors.
 
 import json
 import io
+import hmac
 import os
 import shutil
 import threading
@@ -17,23 +18,91 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+import macd_direction
 
 import orca_whale_options_bot_FAST_60S_5S as bot
 
 # Canonical production scanner threshold for this entry point.
 bot.AUTO_SCAN_MIN_SCORE = 75.0
+bot.ENTRY_SIGNAL_DESCRIPTION = "TradingView MACD 5m 120/180/40 -> contract quality -> Telegram; Gamma informational"
+_ORIGINAL_MASSIVE_CONTRACT_SNAPSHOT = bot.massive_contract_snapshot
+
+
+DATA_PROVIDER = os.getenv("DATA_PROVIDER", "massive").strip().lower()
+AUTO_SCAN_OPENING_WINDOW_MINUTES = max(
+    0, int(os.getenv("AUTO_SCAN_OPENING_WINDOW_MINUTES", "390"))
+)
+AUTO_SCAN_OPENING_INTERVAL_SECONDS = max(
+    60.0, float(os.getenv("AUTO_SCAN_OPENING_INTERVAL_SECONDS", "180"))
+)
+AUTO_MONITOR_ENABLED = os.getenv(
+    "AUTO_MONITOR_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+THETADATA_BASE_URL = os.getenv(
+    "THETADATA_BASE_URL", "http://127.0.0.1:25503"
+).rstrip("/")
+THETADATA_REQUEST_TIMEOUT = max(
+    5.0, float(os.getenv("THETADATA_REQUEST_TIMEOUT", "20"))
+)
+THETADATA_MAX_EXPIRATIONS = max(
+    1, int(os.getenv("THETADATA_MAX_EXPIRATIONS", "8"))
+)
+TRADIER_BASE_URL = os.getenv(
+    "TRADIER_BASE_URL", "https://api.tradier.com"
+).rstrip("/")
+TRADIER_MAX_EXPIRATIONS = max(
+    1, int(os.getenv("TRADIER_MAX_EXPIRATIONS", "8"))
+)
+TRADIER_REQUEST_TIMEOUT = max(
+    5.0, float(os.getenv("TRADIER_REQUEST_TIMEOUT", "20"))
+)
+MARKETDATA_BASE_URL = os.getenv(
+    "MARKETDATA_BASE_URL", "https://api.marketdata.app"
+).rstrip("/")
+MARKETDATA_REQUEST_TIMEOUT = max(
+    5.0, float(os.getenv("MARKETDATA_REQUEST_TIMEOUT", "20"))
+)
+MARKETDATA_CHAIN_CACHE_TTL_SECONDS = float(
+    os.getenv("MARKETDATA_CHAIN_CACHE_TTL_SECONDS", "90")
+)
+_MARKETDATA_CREDIT_LIMIT_LOCK = threading.Lock()
+_MARKETDATA_CREDIT_LIMIT_REASON = None
 
 
 SCAN_IN_PROGRESS_LOCK = threading.Lock()
 CARD_RENDER_LOCK = threading.Lock()
 THREAD_START_LOCK = threading.Lock()
-_STARTED_THREADS = {"scanner": None, "monitor": None}
+_STARTED_THREADS = {"scanner": None, "monitor": None, "ichimoku": None}
 _DUPLICATE_THREAD_START_PREVENTED = False
 _LAST_SUCCESSFUL_STATE_SAVE = None
 _STATE_LOAD_STATUS = "not loaded"
 _RESTORED_ACTIVE_TRADE_COUNT = 0
 _RECOVERY_REQUIRED_COUNT = 0
 _LAST_SCAN_DECISIONS = {}
+_MACD_CACHE = {}
+_MACD_CACHE_LOCK = threading.Lock()
+_SCANNER_STATUS_LOCK = threading.Lock()
+_SCANNER_STATUS = {
+    "last_cycle_started": None,
+    "last_cycle_finished": None,
+    "last_cycle_status": "not started",
+    "last_cycle_checked": 0,
+    "last_cycle_trades": 0,
+    "last_cycle_errors": 0,
+    "last_cycle_ignored": 0,
+    "last_cycle_skipped": 0,
+    "last_cycle_error": None,
+}
+_ICHIMOKU_STATUS_LOCK = threading.Lock()
+_ICHIMOKU_STATUS = {
+    "last_poll_started": None,
+    "last_poll_finished": None,
+    "last_poll_status": "not started",
+    "last_poll_checked": 0,
+    "last_poll_signals": 0,
+    "last_poll_errors": 0,
+    "last_poll_error": None,
+}
 UNDERLYING_PRICE_CACHE_TTL_SECONDS = 120.0
 UNDERLYING_PRICE_BACKOFF_SECONDS = 15.0
 _UNDERLYING_PRICE_CACHE = {}
@@ -48,10 +117,18 @@ MASSIVE_RATE_LIMIT_BACKOFF_SECONDS = float(
 _MASSIVE_CHAIN_CACHE = {}
 _MASSIVE_CHAIN_CACHE_LOCK = threading.Lock()
 _MASSIVE_BACKOFF_UNTIL = 0.0
+_TRADIER_EXPIRATION_CACHE = {}
+_TRADIER_EXPIRATION_CACHE_LOCK = threading.Lock()
+_THETADATA_EXPIRATION_CACHE = {}
+_THETADATA_EXPIRATION_CACHE_LOCK = threading.Lock()
 
 
 class TradeStateCorruptionError(RuntimeError):
     """Raised rather than silently replacing a malformed durable trade file."""
+
+
+class MarketDataAccountCreditLimitError(RuntimeError):
+    """Raised after MarketData explicitly reports an exhausted account limit."""
 
 
 def trade_state_path():
@@ -134,7 +211,52 @@ def _trade_expiration_date(trade):
         return None
 
 
-def _expire_trade_if_needed(store, symbol, trade, now=None):
+def _trade_symbol(trade_key, trade):
+    """Resolve an entry's underlying symbol for legacy and composite keys."""
+    raw = (trade or {}).get("symbol")
+    if not raw:
+        raw = str(trade_key or "").split("::", 1)[0]
+    return str(raw or "").upper().strip()
+
+
+def _iter_trade_entries(store, symbol=None):
+    """Yield (storage key, underlying symbol, state) for every saved contract."""
+    expected_symbol = str(symbol or "").upper().strip() if symbol else None
+    for trade_key, trade in (store.get("trades") or {}).items():
+        if not isinstance(trade, dict):
+            continue
+        trade_symbol = _trade_symbol(trade_key, trade)
+        if expected_symbol is None or trade_symbol == expected_symbol:
+            yield trade_key, trade_symbol, trade
+
+
+def _trade_storage_key(symbol, contract_ticker):
+    normalized_symbol = str(symbol or "").upper().strip()
+    normalized_ticker = bot.canonical_option_ticker(contract_ticker)
+    if not normalized_symbol or not normalized_ticker:
+        raise RuntimeError("Trade storage key requires symbol and option ticker")
+    return f"{normalized_symbol}::{normalized_ticker}"
+
+
+def _find_trade_entry(store, symbol, contract_ticker):
+    target = bot.canonical_option_ticker(contract_ticker)
+    if not target:
+        return None, None
+    for trade_key, _, trade in _iter_trade_entries(store, symbol):
+        if bot.canonical_option_ticker(trade.get("contract_ticker")) == target:
+            return trade_key, trade
+    return None, None
+
+
+def _existing_contract_tickers(store, symbol):
+    return {
+        bot.canonical_option_ticker(trade.get("contract_ticker"))
+        for _, _, trade in _iter_trade_entries(store, symbol)
+        if trade.get("contract_ticker")
+    }
+
+
+def _expire_trade_if_needed(store, trade_key, trade, now=None):
     """Release an old contract without deleting its historical trade record."""
     if not isinstance(trade, dict) or trade.get("status") not in (
         "active", "recovery_required"
@@ -150,7 +272,7 @@ def _expire_trade_if_needed(store, symbol, trade, now=None):
         close_reason="EXPIRED_CONTRACT",
         recovery_note="Contract expiration passed; released for a new signal",
     )
-    store.setdefault("trades", {})[symbol] = trade
+    store.setdefault("trades", {})[trade_key] = trade
     _update_paper_trade(store, trade, int(trade.get("achieved", 0)))
     return True
 
@@ -164,11 +286,31 @@ def restore_durable_trade_state():
         active = 0
         required = 0
         now = bot.now_new_york()
-        for symbol, trade in list(store["trades"].items()):
+        for trade_key, trade in list(store["trades"].items()):
             if not isinstance(trade, dict):
-                raise TradeStateCorruptionError(f"invalid trade record for {symbol}")
+                raise TradeStateCorruptionError(
+                    f"invalid trade record for {trade_key}"
+                )
+            symbol = _trade_symbol(trade_key, trade)
             status = trade.get("status")
-            if _expire_trade_if_needed(store, symbol, trade, now):
+            if _expire_trade_if_needed(store, trade_key, trade, now):
+                changed = True
+                continue
+            if (
+                symbol in bot.EXCLUDED_SYMBOLS
+                and status == "active"
+            ):
+                trade.update(
+                    status="untracked",
+                    untracked_at=now.isoformat(timespec="seconds"),
+                    untracked_reason="USER_EXCLUDED_SYMBOL",
+                )
+                store["trades"][trade_key] = trade
+                print(
+                    "Excluded active contract from monitoring:",
+                    symbol,
+                    trade.get("contract_ticker"),
+                )
                 changed = True
                 continue
             if status == "active" and trade.get("contract_ticker") and trade.get("message_id"):
@@ -183,12 +325,12 @@ def restore_durable_trade_state():
                     trade.update(status="recovery_required",
                                  recovery_note="restart: opening state may have sent Telegram")
                     required += 1
-                store["trades"][symbol] = trade
+                store["trades"][trade_key] = trade
                 changed = True
             elif status == "active" and not trade.get("message_id"):
                 trade.update(status="recovery_required",
                              recovery_note="restart: Telegram send outcome is ambiguous")
-                store["trades"][symbol] = trade
+                store["trades"][trade_key] = trade
                 changed = True
                 required += 1
             elif status == "recovery_required":
@@ -218,25 +360,33 @@ SCORE_DELTA_EXTREME_LOW = float(os.getenv("SCORE_DELTA_EXTREME_LOW", "0.10"))
 SCORE_DELTA_EXTREME_HIGH = float(os.getenv("SCORE_DELTA_EXTREME_HIGH", "0.90"))
 SCORE_MIN_OPEN_INTEREST = max(0.0, float(os.getenv("SCORE_MIN_OPEN_INTEREST", "100")))
 SCORE_MIN_OPTION_VOLUME = max(0.0, float(os.getenv("SCORE_MIN_OPTION_VOLUME", "50")))
-SCORE_MAX_DTE = max(0, int(os.getenv("SCORE_MAX_DTE", "7")))
-SCORE_DTE_0_POINTS = float(os.getenv("SCORE_DTE_0_POINTS", "7"))
-SCORE_DTE_1_3_POINTS = float(os.getenv("SCORE_DTE_1_3_POINTS", "10"))
-SCORE_DTE_4_7_POINTS = float(os.getenv("SCORE_DTE_4_7_POINTS", "7"))
+SCORE_MIN_DTE = max(0, int(os.getenv("SCORE_MIN_DTE", "10")))
+SCORE_MAX_DTE = max(
+    SCORE_MIN_DTE, int(os.getenv("SCORE_MAX_DTE", "30"))
+)
+MAX_OPTION_IMPLIED_VOLATILITY = max(
+    0.0, float(os.getenv("MAX_OPTION_IMPLIED_VOLATILITY", "0.50"))
+)
+MAX_THETA_TO_DELTA_RATIO = 0.50
+ICHIMOKU_30M_SIGNAL_MAX_AGE_SECONDS = 30 * 60
+ICHIMOKU_30M_BAR_MAX_AGE_SECONDS = max(
+    60, int(os.getenv("BOT_ICHIMOKU_MAX_BAR_AGE_SECONDS", "600"))
+)
+ICHIMOKU_30M_POLL_SECONDS = max(
+    60.0, float(os.getenv("BOT_ICHIMOKU_POLL_SECONDS", "300"))
+)
+ICHIMOKU_30M_CLOUD_DISPLACEMENT = 26
 SCORE_DTE_LONGER_POINTS = float(os.getenv("SCORE_DTE_LONGER_POINTS", "3"))
-SCORE_0DTE_MIN_REMAINING_MINUTES = float(
-    os.getenv("SCORE_0DTE_MIN_REMAINING_MINUTES", "90")
+# Temporary test budget for a standard option contract (100 shares). Keep this
+# filter separate from quality scoring so a cheaper contract cannot compensate
+# for weak data; override both bounds with environment variables as needed.
+OPTION_ENTRY_MIN_PREMIUM = max(
+    0.01, float(os.getenv("OPTION_ENTRY_MIN_PREMIUM", "3.75"))
 )
-SCORE_0DTE_MIN_DELTA = float(os.getenv("SCORE_0DTE_MIN_DELTA", "0.40"))
-SCORE_0DTE_MIN_OPEN_INTEREST = max(
-    SCORE_MIN_OPEN_INTEREST, float(os.getenv("SCORE_0DTE_MIN_OPEN_INTEREST", "500"))
+OPTION_ENTRY_MAX_PREMIUM = max(
+    OPTION_ENTRY_MIN_PREMIUM,
+    float(os.getenv("OPTION_ENTRY_MAX_PREMIUM", "10.00")),
 )
-SCORE_0DTE_MIN_OPTION_VOLUME = max(
-    SCORE_MIN_OPTION_VOLUME, float(os.getenv("SCORE_0DTE_MIN_OPTION_VOLUME", "200"))
-)
-SCORE_0DTE_MAX_SPREAD_PERCENT = float(
-    os.getenv("SCORE_0DTE_MAX_SPREAD_PERCENT", "15")
-)
-GAMMA_MAX_DTE = max(0, int(os.getenv("GAMMA_MAX_DTE", "14")))
 GAMMA_FLIP_MAX_RANGE_PCT = max(
     float(getattr(bot, "GAMMA_FLIP_RANGE_PCT", 12.0)),
     float(os.getenv("GAMMA_FLIP_MAX_RANGE_PCT", "50")),
@@ -313,6 +463,7 @@ def normalize_contract(raw, stock_price):
         "day_close": _present_number(day.get("close")),
         "day_open": _present_number(day.get("open")),
         "spread_percent": spread,
+        "quote_timestamp": quote_stamp,
         "quote_age_seconds": quote_age,
         "trade_age_seconds": trade_age,
         "quote_fresh": quote_fresh,
@@ -331,10 +482,20 @@ def _contract_dte(expiration, now=None):
         return None
 
 
-def _remaining_regular_session_minutes(now=None):
+def _contract_in_dte_window(expiration, now=None):
+    dte = _contract_dte(expiration, now)
+    return dte is not None and SCORE_MIN_DTE <= dte <= SCORE_MAX_DTE
+
+
+def _filter_contracts_by_dte(records, now=None):
     now = now or bot.now_new_york()
-    close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    return max(0.0, (close - now).total_seconds() / 60.0)
+    filtered = []
+    for record in records or []:
+        details = record.get("details", {}) or {}
+        expiration = details.get("expiration_date")
+        if _contract_in_dte_window(expiration, now):
+            filtered.append(record)
+    return filtered
 
 
 def _progressive_points(value, minimum, full_at, maximum):
@@ -363,6 +524,15 @@ def calculate_score(contract, stock_price, now=None):
         contract.get("midpoint")
         or contract.get("last")
         or contract.get("day_close")
+    )
+    ask = bot.safe_float(contract.get("ask"))
+    execution_price = ask if ask > 0 else price
+    contract["reference_premium_per_share"] = round(price, 4) if price > 0 else None
+    contract["execution_premium_per_share"] = (
+        round(execution_price, 4) if execution_price > 0 else None
+    )
+    contract["estimated_contract_cost_usd"] = (
+        round(execution_price * 100.0, 2) if execution_price > 0 else None
     )
 
     if ad is None:
@@ -396,13 +566,7 @@ def calculate_score(contract, stock_price, now=None):
     distance_pct = (bot.safe_float(contract.get("distance")) / stock_price * 100.0
                     if stock_price > 0 else 100.0)
     distance_points = 12.0 * max(0.0, 1.0 - distance_pct / 5.0)
-    if dte == 0:
-        dte_points = SCORE_DTE_0_POINTS
-    elif dte is not None and 1 <= dte <= 3:
-        dte_points = SCORE_DTE_1_3_POINTS
-    elif dte is not None and 4 <= dte <= 7:
-        dte_points = SCORE_DTE_4_7_POINTS
-    elif dte is not None and 8 <= dte <= SCORE_MAX_DTE:
+    if dte is not None and SCORE_MIN_DTE <= dte <= SCORE_MAX_DTE:
         dte_points = SCORE_DTE_LONGER_POINTS
     else:
         dte_points = 0.0
@@ -456,10 +620,32 @@ def calculate_score(contract, stock_price, now=None):
         "freshness_completeness": round(completeness_points, 2),
     }
     rejection_reasons = []
-    if dte is None or dte < 0 or dte > SCORE_MAX_DTE:
-        rejection_reasons.append(f"DTE {dte} outside 0-{SCORE_MAX_DTE}")
+    if dte is None or dte < SCORE_MIN_DTE or dte > SCORE_MAX_DTE:
+        rejection_reasons.append(
+            f"DTE {dte} outside {SCORE_MIN_DTE}-{SCORE_MAX_DTE}"
+        )
+    if price <= 0:
+        rejection_reasons.append("option premium unavailable")
+    elif not OPTION_ENTRY_MIN_PREMIUM <= execution_price <= OPTION_ENTRY_MAX_PREMIUM:
+        premium_label = "ask premium" if ask > 0 else "premium"
+        rejection_reasons.append(
+            f"{premium_label} ${execution_price:.2f} outside "
+            f"${OPTION_ENTRY_MIN_PREMIUM:.2f}-${OPTION_ENTRY_MAX_PREMIUM:.2f}"
+        )
+    if iv is not None and iv > MAX_OPTION_IMPLIED_VOLATILITY:
+        rejection_reasons.append(
+            f"IV {iv:.1%} exceeds maximum "
+            f"{MAX_OPTION_IMPLIED_VOLATILITY:.1%}"
+        )
     if delta is None:
         rejection_reasons.append("Delta unavailable")
+    if theta is None:
+        rejection_reasons.append("Theta unavailable")
+    elif delta is not None and abs(theta) > ad * MAX_THETA_TO_DELTA_RATIO:
+        rejection_reasons.append(
+            f"|Theta| {abs(theta):.4f} exceeds "
+            f"{MAX_THETA_TO_DELTA_RATIO:.0%} of |Delta| {ad:.4f}"
+        )
     if oi is None:
         rejection_reasons.append("open interest unavailable")
     elif oi < SCORE_MIN_OPEN_INTEREST:
@@ -468,22 +654,6 @@ def calculate_score(contract, stock_price, now=None):
         rejection_reasons.append("volume unavailable")
     elif volume < SCORE_MIN_OPTION_VOLUME:
         rejection_reasons.append(f"volume {volume:.0f} < {SCORE_MIN_OPTION_VOLUME:.0f}")
-    if dte == 0:
-        remaining = _remaining_regular_session_minutes(now)
-        if remaining < SCORE_0DTE_MIN_REMAINING_MINUTES:
-            rejection_reasons.append(
-                f"0DTE cutoff: {remaining:.0f} < {SCORE_0DTE_MIN_REMAINING_MINUTES:.0f} minutes"
-            )
-        if ad is None or ad < SCORE_0DTE_MIN_DELTA:
-            rejection_reasons.append("0DTE Delta below stricter minimum")
-        if oi is None or oi < SCORE_0DTE_MIN_OPEN_INTEREST:
-            rejection_reasons.append("0DTE OI below stricter minimum")
-        if volume is None or volume < SCORE_0DTE_MIN_OPTION_VOLUME:
-            rejection_reasons.append("0DTE volume below stricter minimum")
-        if spread is None:
-            rejection_reasons.append("0DTE fresh spread unavailable")
-        elif spread > SCORE_0DTE_MAX_SPREAD_PERCENT:
-            rejection_reasons.append("0DTE spread above stricter maximum")
     score = round(max(0.0, min(100.0, sum(breakdown.values()))), 1)
     contract.update(
         score=score,
@@ -491,6 +661,11 @@ def calculate_score(contract, stock_price, now=None):
         dte=dte,
         critical_inputs=critical,
         optional_inputs=optional,
+        theta_delta_ratio=(
+            round(abs(theta) / ad, 4)
+            if theta is not None and ad is not None and ad > 0
+            else None
+        ),
         completeness_percent=round(
             100.0 * (sum(critical.values()) + sum(optional.values())) /
             (len(critical) + len(optional)), 1
@@ -511,6 +686,39 @@ class ScoredCandidateList(list):
         self.skipped_identity = skipped_identity
 
 
+def _exclude_recorded_contracts(candidates, recorded_tickers):
+    """Keep new eligible contracts while marking exact prior alerts as duplicates."""
+    recorded = {
+        bot.canonical_option_ticker(ticker)
+        for ticker in (recorded_tickers or set())
+        if ticker
+    }
+    all_candidates = list(getattr(candidates, "all_candidates", candidates))
+    annotated = []
+    for candidate in all_candidates:
+        ticker = bot.canonical_option_ticker(candidate.get("ticker"))
+        if ticker in recorded:
+            item = dict(candidate)
+            item["selection_eligible"] = False
+            reasons = list(item.get("rejection_reasons") or [])
+            if "exact contract already recorded" not in reasons:
+                reasons.append("exact contract already recorded")
+            item["rejection_reasons"] = reasons
+            annotated.append(item)
+        else:
+            annotated.append(candidate)
+    eligible = [
+        candidate for candidate in candidates
+        if bot.canonical_option_ticker(candidate.get("ticker")) not in recorded
+    ]
+    return ScoredCandidateList(
+        eligible,
+        annotated,
+        raw_count=getattr(candidates, "raw_count", len(all_candidates)),
+        skipped_identity=getattr(candidates, "skipped_identity", 0),
+    )
+
+
 def _candidate_diagnostic(contract, winner_score):
     return {
         "ticker": contract.get("ticker"),
@@ -522,6 +730,7 @@ def _candidate_diagnostic(contract, winner_score):
         ),
         "eligible": bool(contract.get("selection_eligible")),
         "rejection_reasons": contract.get("rejection_reasons") or [],
+        "theta_delta_ratio": contract.get("theta_delta_ratio"),
         "critical_inputs": contract.get("critical_inputs") or {},
         "optional_inputs": contract.get("optional_inputs") or {},
         "completeness_percent": contract.get("completeness_percent"),
@@ -530,7 +739,7 @@ def _candidate_diagnostic(contract, winner_score):
 
 
 def _prepare_side(raw_chain, stock_price):
-    """Score all near-term expirations so safer 1-3 DTE can outrank 0DTE."""
+    """Score only contracts within the configured 10-30 DTE window."""
     all_candidates = []
     raw_count = len(raw_chain or [])
     skipped_identity = 0
@@ -598,6 +807,54 @@ def choose_initial_price(contract):
     return 0.0, "Unavailable"
 
 
+def refresh_contract_quote_for_entry(symbol, contract, stock_price):
+    """Refresh the selected option's exact quote immediately before alerting."""
+    ticker = bot.canonical_option_ticker(contract.get("ticker"))
+    snapshot = provider_contract_snapshot(symbol, ticker)
+    raw = _snapshot_data(snapshot)
+    refreshed = normalize_contract(raw, stock_price)
+    if refreshed.get("ticker") != ticker:
+        raise RuntimeError("WAIT - FRESH QUOTE CONTRACT DID NOT MATCH")
+    if (
+        refreshed.get("expiration") != contract.get("expiration")
+        or abs(
+            bot.safe_float(refreshed.get("strike"))
+            - bot.safe_float(contract.get("strike"))
+        ) > 0.0001
+    ):
+        raise RuntimeError("WAIT - FRESH QUOTE CONTRACT DETAILS DID NOT MATCH")
+    bid = bot.safe_float(refreshed.get("bid"))
+    ask = bot.safe_float(refreshed.get("ask"))
+    midpoint = bot.safe_float(refreshed.get("midpoint"))
+    if (
+        not refreshed.get("quote_fresh")
+        or bid <= 0
+        or ask < bid
+        or midpoint <= 0
+    ):
+        raise RuntimeError("WAIT - FRESH TWO-SIDED OPTION QUOTE REQUIRED")
+
+    selected = dict(contract)
+    quote_fields = (
+        "bid", "ask", "midpoint", "spread_percent", "quote_timestamp",
+        "quote_age_seconds", "trade_age_seconds", "quote_fresh",
+        "trade_fresh", "last", "day_close",
+    )
+    for key in quote_fields:
+        selected[key] = refreshed.get(key)
+    for key in ("delta", "theta", "iv", "volume", "open_interest"):
+        if refreshed.get(key) is not None:
+            selected[key] = refreshed[key]
+
+    calculate_score(selected, stock_price)
+    if not selected.get("selection_eligible"):
+        reasons = "; ".join(selected.get("rejection_reasons") or [])
+        raise RuntimeError(
+            f"WAIT - FRESH QUOTE NO LONGER QUALIFIES: {reasons or 'contract filters'}"
+        )
+    return selected
+
+
 def _confidence_class(value):
     if value >= CONSERVATIVE_HIGH_CONFIDENCE:
         return "HIGH"
@@ -650,6 +907,9 @@ def _conservative_assessment(
             "wait_reasons": ["WAIT - DATA INCOMPLETE"],
             "trade_confidence": {"score": 0.0, "level": "LOW", "components": {}},
             "entry_price": 0.0, "entry_source": "Unavailable",
+            "gamma_direction_state": gamma_direction_state(
+                direction, stock_price, gamma_info
+            ),
         }
     gamma_state = gamma_direction_state(direction, stock_price, gamma_info)
     entry, entry_source = choose_initial_price(contract)
@@ -681,7 +941,7 @@ def _conservative_assessment(
         contract.get("volume")
     ) < SCORE_MIN_OPTION_VOLUME:
         reasons.append("WAIT - LOW VOLUME")
-    if dte is None or dte < 0 or dte > SCORE_MAX_DTE:
+    if dte is None or dte < SCORE_MIN_DTE or dte > SCORE_MAX_DTE:
         reasons.append("WAIT - DATA INCOMPLETE")
     if contract.get("theta") is None or contract.get("iv") is None:
         reasons.append("WAIT - DATA INCOMPLETE")
@@ -698,12 +958,7 @@ def _conservative_assessment(
         < CONSERVATIVE_MIN_COMPLETENESS
     ):
         reasons.append("WAIT - GAMMA UNAVAILABLE / EVIDENCE NOT STRONG ENOUGH")
-    if dte == 0:
-        if contract.get("spread_percent") is None:
-            reasons.append("WAIT - SPREAD UNAVAILABLE")
-        if any("0DTE cutoff" in reason for reason in contract.get("rejection_reasons") or []):
-            reasons.append("WAIT - 0DTE TOO LATE")
-    elif (
+    if (
         contract.get("spread_percent") is None
         and entry_source != "Delayed Session Close (Reference Only)"
         and score < ORCA_CONSERVATIVE_MIN_SCORE + 5
@@ -731,6 +986,51 @@ def _conservative_assessment(
         "entry_price": entry,
         "entry_source": entry_source,
         "gamma_direction_state": gamma_state,
+    }
+
+
+def _macd_contract_assessment(direction, contract, gamma_info, stock_price, minimum_score):
+    """Keep contract safeguards without letting Gamma/flow vote on MACD side."""
+    if not contract:
+        return {
+            "can_open": False, "wait_status": "WAIT - NO QUALIFIED CONTRACT",
+            "wait_reasons": ["WAIT - NO QUALIFIED CONTRACT"],
+            "trade_confidence": {"score": 0, "level": "LOW", "components": {}},
+            "gamma_direction_state": gamma_direction_state(direction, stock_price, gamma_info),
+        }
+    entry, source = choose_initial_price(contract)
+    score = bot.safe_float(contract.get("score"))
+    completeness = bot.safe_float(contract.get("completeness_percent"))
+    reasons = list(contract.get("rejection_reasons") or [])
+    if not contract.get("selection_eligible"):
+        reasons.append("WAIT - CONTRACT QUALITY FILTERS")
+    if score < minimum_score:
+        reasons.append("WAIT - SCORE TOO LOW")
+    if completeness < CONSERVATIVE_MIN_COMPLETENESS:
+        reasons.append("WAIT - DATA INCOMPLETE")
+    if entry <= 0 or source != "Fresh Bid/Ask Midpoint":
+        reasons.append("WAIT - LIVE OPTION PRICE REQUIRED")
+    # Normalize only quality components; do not invent a MACD success probability
+    # or carry old Gamma/relative-flow votes into the HIGH-confidence gate.
+    components = {
+        "contract_score": score * 0.45,
+        "data_completeness": completeness * 0.20,
+        "entry_price_quality": 7.0 if source == "Fresh Bid/Ask Midpoint" else 0,
+        "spread_availability": 3.0 if contract.get("spread_percent") is not None else 0,
+    }
+    value = round(min(100.0, sum(components.values()) / 0.75), 1)
+    confidence = {
+        "score": value, "level": _confidence_class(value),
+        "components": components, "method": "contract_quality_not_success_probability",
+    }
+    if confidence["level"] != "HIGH":
+        reasons.append("WAIT - CONFIDENCE NOT HIGH")
+    reasons = list(dict.fromkeys(reasons))
+    return {
+        "can_open": not reasons, "wait_status": reasons[0] if reasons else "TRADE",
+        "wait_reasons": reasons, "trade_confidence": confidence,
+        "entry_price": entry, "entry_source": source,
+        "gamma_direction_state": gamma_direction_state(direction, stock_price, gamma_info),
     }
 
 
@@ -882,7 +1182,15 @@ def _unix_seconds(value):
     try:
         stamp = float(value)
     except (TypeError, ValueError):
-        return None
+        try:
+            parsed = bot.datetime.fromisoformat(
+                str(value).replace("Z", "+00:00")
+            )
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=bot.NEW_YORK_TZ)
+            return parsed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
     if stamp <= 0:
         return None
     # Epoch values currently have 10, 13, 16, or 19 digits.  Magnitude avoids
@@ -894,6 +1202,301 @@ def _unix_seconds(value):
     elif stamp >= 1e11:
         stamp /= 1e3
     return stamp
+
+
+def _ichimoku_30m_signal_from_payload(payload, now=None):
+    """Validate a closed 30-minute Ichimoku event payload."""
+    payload = payload if isinstance(payload, dict) else {}
+    direction = _tradingview_direction(payload)
+    signal_type = str(payload.get("signal_type") or "").upper().strip()
+    if direction not in ("CALL", "PUT") or signal_type != f"ICHIMOKU_{direction}":
+        raise ValueError("signal must be ICHIMOKU_CALL or ICHIMOKU_PUT")
+
+    interval = str(payload.get("interval") or payload.get("timeframe") or "")
+    interval = interval.strip().lower().replace(" ", "")
+    if interval not in {"30", "30m", "30min", "30minute", "30minutes"}:
+        raise ValueError("Ichimoku trigger must use the 30-minute timeframe")
+
+    symbol = _tradingview_symbol(
+        payload.get("ticker") or payload.get("symbol")
+    )
+    if not symbol or symbol not in bot.WATCHLIST:
+        raise ValueError("ticker is not in the ORCA watchlist")
+    if symbol in bot.EXCLUDED_SYMBOLS:
+        raise ValueError("ticker is excluded from contract selection")
+
+    bar_time_seconds = _unix_seconds(payload.get("bar_time"))
+    if bar_time_seconds is None:
+        raise ValueError("30-minute Ichimoku signal is missing bar_time")
+    source = str(payload.get("source") or "external_webhook")[:80]
+    max_age_seconds = (
+        ICHIMOKU_30M_BAR_MAX_AGE_SECONDS
+        if source == "orca_internal_massive"
+        else ICHIMOKU_30M_SIGNAL_MAX_AGE_SECONDS
+    )
+    now = now or bot.now_new_york()
+    age_seconds = now.timestamp() - bar_time_seconds
+    if age_seconds < -30:
+        raise ValueError("30-minute Ichimoku bar_time is in the future")
+    if age_seconds > max_age_seconds:
+        raise ValueError("30-minute Ichimoku signal is stale")
+
+    price = bot.safe_float(payload.get("price"))
+    if price <= 0:
+        raise ValueError("30-minute Ichimoku signal has no valid stock price")
+
+    bar_time_ms = int(round(bar_time_seconds * 1000))
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "signal_type": signal_type,
+        "timeframe": "30",
+        "bar_time_ms": bar_time_ms,
+        "bar_time_seconds": bar_time_seconds,
+        "event_id": f"{symbol}:{direction}:{bar_time_ms}",
+        "price": price,
+        "source": source,
+    }
+
+
+def _completed_regular_30m_bars(bars, now=None):
+    """Normalize only completed, regular-session 30-minute stock bars."""
+    now = now or bot.now_new_york()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=bot.NEW_YORK_TZ)
+    else:
+        now = now.astimezone(bot.NEW_YORK_TZ)
+    now_seconds = now.timestamp()
+    normalized = {}
+
+    if not isinstance(bars, list):
+        raise ValueError("30-minute aggregate response has no bars")
+
+    for raw in bars:
+        if not isinstance(raw, dict):
+            continue
+        start_seconds = _unix_seconds(raw.get("t"))
+        high = _present_number(raw.get("h"))
+        low = _present_number(raw.get("l"))
+        close = _present_number(raw.get("c"))
+        if (
+            start_seconds is None
+            or high is None
+            or low is None
+            or close is None
+            or min(high, low, close) <= 0
+            or high < low
+            or close < low
+            or close > high
+        ):
+            continue
+
+        start = bot.datetime.fromtimestamp(
+            start_seconds, bot.NEW_YORK_TZ
+        )
+        start_minute = start.hour * 60 + start.minute
+        market_open_minute = 9 * 60 + 30
+        if (
+            start_minute < market_open_minute
+            or start_minute >= 16 * 60
+            or (start_minute - market_open_minute) % 30 != 0
+            or start.second != 0
+            or start.microsecond != 0
+        ):
+            continue
+
+        close_seconds = start_seconds + 30 * 60
+        if close_seconds > now_seconds:
+            continue
+        normalized[int(round(start_seconds * 1000))] = {
+            "start_seconds": start_seconds,
+            "close_seconds": close_seconds,
+            "high": high,
+            "low": low,
+            "close": close,
+        }
+
+    return [normalized[key] for key in sorted(normalized)]
+
+
+def _ichimoku_30m_signal_from_bars(symbol, bars, now=None):
+    """Calculate one closed-bar Ichimoku crossing from Massive aggregates."""
+    symbol = str(symbol or "").upper().strip()
+    if not symbol or symbol not in bot.WATCHLIST:
+        raise ValueError("ticker is not in the ORCA watchlist")
+    if symbol in bot.EXCLUDED_SYMBOLS:
+        raise ValueError("ticker is excluded from contract selection")
+
+    completed = _completed_regular_30m_bars(bars, now=now)
+    minimum_bars = 3 * ICHIMOKU_30M_CLOUD_DISPLACEMENT + 1
+    if len(completed) < minimum_bars:
+        raise ValueError(
+            f"insufficient completed 30-minute bars ({len(completed)}/{minimum_bars})"
+        )
+
+    now = now or bot.now_new_york()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=bot.NEW_YORK_TZ)
+    else:
+        now = now.astimezone(bot.NEW_YORK_TZ)
+    latest = completed[-1]
+    age_seconds = now.timestamp() - latest["close_seconds"]
+    if age_seconds < -30:
+        raise ValueError("latest completed 30-minute bar is in the future")
+    if age_seconds > ICHIMOKU_30M_BAR_MAX_AGE_SECONDS:
+        raise ValueError(
+            f"latest completed 30-minute bar is stale ({int(age_seconds)}s old)"
+        )
+
+    highs = [bar["high"] for bar in completed]
+    lows = [bar["low"] for bar in completed]
+    closes = [bar["close"] for bar in completed]
+
+    def midpoint(index, length):
+        start = index - length + 1
+        if start < 0:
+            return None
+        return (
+            max(highs[start:index + 1]) + min(lows[start:index + 1])
+        ) / 2.0
+
+    def levels(index):
+        tenkan = midpoint(index, 9)
+        kijun = midpoint(index, 26)
+        cloud_source_index = index - ICHIMOKU_30M_CLOUD_DISPLACEMENT
+        span_a = (
+            midpoint(cloud_source_index, 9)
+            + midpoint(cloud_source_index, 26)
+        ) / 2.0
+        span_b = midpoint(cloud_source_index, 52)
+        return {
+            "tenkan": tenkan,
+            "kijun": kijun,
+            "cloud_top": max(span_a, span_b),
+            "cloud_bottom": min(span_a, span_b),
+        }
+
+    current_index = len(completed) - 1
+    previous_levels = levels(current_index - 1)
+    current_levels = levels(current_index)
+    previous_close = closes[current_index - 1]
+    current_close = closes[current_index]
+
+    crossed_up = any(
+        previous_close <= previous_levels[name]
+        and current_close > current_levels[name]
+        for name in ("tenkan", "kijun", "cloud_top")
+    )
+    crossed_down = any(
+        previous_close >= previous_levels[name]
+        and current_close < current_levels[name]
+        for name in ("tenkan", "kijun", "cloud_bottom")
+    )
+    if crossed_up == crossed_down:
+        return None
+
+    direction = "CALL" if crossed_up else "PUT"
+    close_seconds = latest["close_seconds"]
+    return {
+        "ticker": symbol,
+        "direction": direction,
+        "signal_type": f"ICHIMOKU_{direction}",
+        "interval": "30",
+        "price": current_close,
+        "bar_time": int(round(close_seconds * 1000)),
+        "source": "orca_internal_massive",
+        "bar_age_seconds": round(age_seconds, 2),
+    }
+
+
+def _register_ichimoku_30m_signal(payload, now=None):
+    """Persist the newest valid 30-minute crossing and reject duplicate bars."""
+    signal = _ichimoku_30m_signal_from_payload(payload, now=now)
+    with bot.TRADE_STATE_LOCK:
+        store = bot._load_trade_store()
+        signals = store.setdefault("ichimoku_30m_signals", {})
+        previous = signals.get(signal["symbol"])
+        if isinstance(previous, dict):
+            if previous.get("event_id") == signal["event_id"]:
+                if previous.get("consumed"):
+                    return None, "duplicate 30-minute Ichimoku event"
+                return dict(previous), None
+            previous_time = bot.safe_float(previous.get("bar_time_ms"))
+            if previous_time >= signal["bar_time_ms"]:
+                return None, "older 30-minute Ichimoku event"
+
+        last_contract_directions = (
+            store.get("ichimoku_30m_last_contract_directions") or {}
+        )
+        if last_contract_directions.get(signal["symbol"]) == signal["direction"]:
+            return None, "same-direction Ichimoku contract already sent"
+
+        signal.update(
+            consumed=False,
+            received_at=(now or bot.now_new_york()).isoformat(timespec="seconds"),
+        )
+        signals[signal["symbol"]] = signal
+        bot._save_trade_store(store)
+    return signal, None
+
+
+def _active_ichimoku_30m_signal(symbol, now=None):
+    """Return an unconsumed, fresh 30-minute crossover for one symbol."""
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return None
+    now = now or bot.now_new_york()
+    with bot.TRADE_STATE_LOCK:
+        store = bot._load_trade_store()
+        signal = (store.get("ichimoku_30m_signals") or {}).get(symbol)
+        if not isinstance(signal, dict) or signal.get("consumed"):
+            return None
+        if signal.get("source") != "orca_internal_massive":
+            return None
+        event_time = _unix_seconds(signal.get("bar_time_ms"))
+        if event_time is None:
+            return None
+        age_seconds = now.timestamp() - event_time
+        if (
+            age_seconds < -30
+            or age_seconds > ICHIMOKU_30M_BAR_MAX_AGE_SECONDS
+        ):
+            return None
+        return dict(signal)
+
+
+def _consume_ichimoku_30m_signal(symbol, event_id):
+    """Mark a 30-minute crossover used after a trade is opened or duplicated."""
+    symbol = str(symbol or "").upper().strip()
+    if not symbol or not event_id:
+        return False
+    with bot.TRADE_STATE_LOCK:
+        store = bot._load_trade_store()
+        signals = store.get("ichimoku_30m_signals") or {}
+        signal = signals.get(symbol)
+        if not isinstance(signal, dict) or signal.get("event_id") != event_id:
+            return False
+        last_contract_directions = (
+            store.get("ichimoku_30m_last_contract_directions") or {}
+        )
+        if signal.get("consumed"):
+            if last_contract_directions.get(symbol) != signal["direction"]:
+                last_contract_directions[symbol] = signal["direction"]
+                store["ichimoku_30m_last_contract_directions"] = (
+                    last_contract_directions
+                )
+                bot._save_trade_store(store)
+            return True
+        signal["consumed"] = True
+        signal["consumed_at"] = bot.now_new_york().isoformat(timespec="seconds")
+        signals[symbol] = signal
+        store["ichimoku_30m_signals"] = signals
+        last_contract_directions[symbol] = signal["direction"]
+        store["ichimoku_30m_last_contract_directions"] = (
+            last_contract_directions
+        )
+        bot._save_trade_store(store)
+        return True
 
 
 def _newest_timestamp(values):
@@ -1046,7 +1649,7 @@ def _card_fitted_font(draw, text, maximum_size, maximum_width, minimum_size=16, 
 
 
 def _card_gamma_values(state):
-    """Format only canonical Phase 5 Gamma results for the card."""
+    """Format a usable modeled Gamma Flip; omit unavailable results."""
     raw_status = str(
         state.get("gamma_status") or state.get("gamma_regime") or "INSUFFICIENT DATA"
     ).strip().upper()
@@ -1072,21 +1675,11 @@ def _card_gamma_values(state):
         ]
         return f"${flip:.2f}", " • ".join(status_parts) or "FOUND"
 
-    if raw_status == "NO FLIP IN RANGE":
-        gamma_status = regime if regime not in ("", "FOUND") else "NO FLIP IN RANGE"
-        return "NO FLIP IN RANGE", gamma_status
-
-    if raw_status in ("INSUFFICIENT DATA", "INSUFFICIENT"):
-        return "INSUFFICIENT DATA", "INSUFFICIENT DATA"
-
-    if raw_status == "CALCULATION UNAVAILABLE":
-        return "INSUFFICIENT DATA", "INSUFFICIENT DATA"
-
-    return "INSUFFICIENT DATA", "INSUFFICIENT DATA"
+    return None, None
 
 
 def _paste_card_logo(image, symbol, box):
-    """Fill the existing logo square while preserving the downloaded logo ratio."""
+    """Fill the logo square, removing transparent margins without distortion."""
     x1, y1, x2, y2 = box
     inner_width = max(1, x2 - x1 - 8)
     inner_height = max(1, y2 - y1 - 8)
@@ -1106,10 +1699,81 @@ def _paste_card_logo(image, symbol, box):
             fill=(242, 247, 250),
         )
         return
-    logo.thumbnail((inner_width, inner_height), bot.Image.Resampling.LANCZOS)
-    x = x1 + ((x2 - x1) - logo.width) // 2
-    y = y1 + ((y2 - y1) - logo.height) // 2
-    image.paste(logo, (x, y), logo)
+
+    # Clearbit assets often include transparent padding around the visible mark.
+    # Crop that padding first, then use a cover fit so the card square is filled.
+    alpha = logo.getchannel("A") if logo.mode == "RGBA" else None
+    visible_bounds = alpha.getbbox() if alpha is not None else logo.getbbox()
+    if visible_bounds:
+        logo = logo.crop(visible_bounds)
+
+    scale = max(inner_width / logo.width, inner_height / logo.height)
+    resized = logo.resize(
+        (
+            max(inner_width, round(logo.width * scale)),
+            max(inner_height, round(logo.height * scale)),
+        ),
+        bot.Image.Resampling.LANCZOS,
+    )
+    left = max(0, (resized.width - inner_width) // 2)
+    top = max(0, (resized.height - inner_height) // 2)
+    fitted = resized.crop((left, top, left + inner_width, top + inner_height))
+    image.paste(fitted, (x1 + 4, y1 + 4), fitted if fitted.mode == "RGBA" else None)
+
+
+def _card_is_tracking(state, monitor_enabled=None):
+    monitor_enabled = (
+        AUTO_MONITOR_ENABLED if monitor_enabled is None else bool(monitor_enabled)
+    )
+    return bool(
+        monitor_enabled and state.get("last_successful_option_price_update")
+    )
+
+
+def _card_badge(state, monitor_enabled=None):
+    status = str(state.get("status", "active")).lower()
+    if status == "test":
+        return "TEST"
+    if status == "active":
+        return "TRACKING" if _card_is_tracking(state, monitor_enabled) else "SIGNAL"
+    if status == "stopped":
+        return "STOPPED"
+    return "COMPLETED"
+
+
+def _card_price_metrics(state, monitor_enabled=None):
+    """Choose labels that distinguish a quote snapshot from tracked prices."""
+    monitor_enabled = (
+        AUTO_MONITOR_ENABLED if monitor_enabled is None else bool(monitor_enabled)
+    )
+    monitor_enabled = (
+        AUTO_MONITOR_ENABLED if monitor_enabled is None else bool(monitor_enabled)
+    )
+    entry = bot.safe_float(state.get("entry_price"))
+    midpoint = bot.safe_float(state.get("midpoint"))
+    entry_mark = midpoint if midpoint > 0 else entry
+    is_tracking = _card_is_tracking(state, monitor_enabled)
+    entry_label = "ENTRY MID" if midpoint > 0 else "ENTRY PRICE"
+
+    if is_tracking:
+        current = bot.safe_float(state.get("current_price"), entry)
+        change = current - entry
+        change_percent = ((current / entry) - 1) * 100 if entry else 0.0
+        return [
+            (75, entry_label, f"${entry_mark:.3f}", "value"),
+            (390, "CURRENT MARK", f"${current:.2f}", "value"),
+            (705, "CHANGE", f"{change:+.2f} ({change_percent:+.1f}%)", "change"),
+        ]
+
+    bid = bot.safe_float(state.get("bid"))
+    ask = bot.safe_float(state.get("ask"))
+    bid_ask = f"${bid:.2f} / ${ask:.2f}" if bid > 0 and ask >= bid else "N/A"
+    update_state = "WAITING" if monitor_enabled else "OFF"
+    return [
+        (75, entry_label, f"${entry_mark:.3f}", "value"),
+        (390, "ENTRY BID / ASK", bid_ask, "value"),
+        (705, "PRICE UPDATES", update_state, "status"),
+    ]
 
 
 def render_trade_card(state):
@@ -1123,6 +1787,7 @@ def render_trade_card(state):
     muted = (157, 174, 188)
     blue = (73, 171, 255)
     green = (45, 220, 90)
+    yellow = (245, 190, 55)
     red = (255, 69, 69)
 
     image = bot.Image.new("RGB", (width, height), background)
@@ -1144,11 +1809,9 @@ def render_trade_card(state):
     direction = str(state["direction"]).upper()
     direction_color = green if direction == "CALL" else red
     status = str(state.get("status", "active")).lower()
+    is_tracking = _card_is_tracking(state)
     achieved = max(0, min(5, int(state.get("achieved", 0))))
     entry = bot.safe_float(state["entry_price"])
-    current = bot.safe_float(state.get("current_price"), entry)
-    change = current - entry
-    change_percent = ((current / entry) - 1) * 100 if entry else 0.0
     targets = list(state["targets"])
     stop = bot.safe_float(state["stop_loss"])
     dte = bot._days_to_expiry(state["expiration"])
@@ -1156,12 +1819,23 @@ def render_trade_card(state):
     gamma_flip, gamma_status = _card_gamma_values(state)
 
     draw.text((65, 78), "ORCA WHALE OPTIONS SIGNAL", font=bot._font(39, True), fill=blue)
-    badge = "LIVE" if status == "active" else ("STOPPED" if status == "stopped" else "COMPLETED")
-    badge_color = green if status == "active" else (red if status == "stopped" else blue)
+    badge = _card_badge(state)
+    badge_color = (
+        yellow if status == "test"
+        else green if is_tracking
+        else blue if status == "active"
+        else red if status == "stopped"
+        else blue
+    )
     draw.rounded_rectangle(
         (840, 76, 980, 126),
         radius=15,
-        fill=(12, 62, 37) if status == "active" else (65, 25, 29),
+        fill=(
+            (62, 52, 12) if status == "test"
+            else (12, 62, 37) if is_tracking
+            else (12, 40, 62) if status == "active"
+            else (65, 25, 29)
+        ),
     )
     badge_font = _card_fitted_font(draw, badge, 24, 112, 17, True)
     badge_bounds = draw.textbbox((0, 0), badge, font=badge_font)
@@ -1194,18 +1868,19 @@ def render_trade_card(state):
     draw.text((75, 402), summary, font=summary_font, fill=muted)
 
     metric_y = 480
-    metrics = [(75, "ENTRY PRICE", entry), (390, "CURRENT PRICE", current), (705, "CHANGE", None)]
-    for x, label, value in metrics:
+    for x, label, value, value_kind in _card_price_metrics(state):
         draw.text((x, metric_y), label, font=bot._font(22, True), fill=blue)
-        if label == "CHANGE":
-            text = f"{change:+.2f} ({change_percent:+.1f}%)"
-            font = _card_fitted_font(draw, text, 40, 300, 25, True)
-            draw.text((x, metric_y + 47), text, font=font, fill=green if change_percent >= 0 else red)
+        if value_kind == "change":
+            font = _card_fitted_font(draw, value, 34, 300, 21, True)
+            color = green if not value.startswith("-") else red
+            draw.text((x, metric_y + 47), value, font=font, fill=color)
         else:
-            draw.text((x, metric_y + 47), f"${value:.2f}", font=bot._font(42, True), fill=white)
+            color = yellow if value_kind == "status" else white
+            font = _card_fitted_font(draw, value, 36, 300, 22, True)
+            draw.text((x, metric_y + 47), value, font=font, fill=color)
     draw.line((70, 602, 1010, 602), fill=line, width=2)
 
-    draw.text((75, 632), "PROFIT TARGETS", font=bot._font(31, True), fill=blue)
+    draw.text((75, 632), "TARGETS FROM ENTRY MID", font=bot._font(31, True), fill=blue)
     percentages = [20, 45, 70, 100, 150]
     target_cells = [
         (75, 690), (390, 690), (705, 690),
@@ -1233,12 +1908,17 @@ def render_trade_card(state):
     draw.rounded_rectangle(
         (705, 807, 970, 905), radius=20, fill=(45, 20, 25), outline=(145, 38, 48), width=2
     )
-    draw.text((728, 824), "STOP LOSS", font=bot._font(21, True), fill=red)
+    draw.text((728, 824), "STOP LEVEL (MID)", font=bot._font(21, True), fill=red)
     stop_text = f"${stop:.2f}  (-45%)"
     stop_font = _card_fitted_font(draw, stop_text, 29, 220, 22, True)
     draw.text((728, 857), stop_text, font=stop_font, fill=white)
 
-    draw.text((75, 930), f"TARGET PROGRESS   {achieved}/5", font=bot._font(24, True), fill=white)
+    progress_label = (
+        f"TARGET PROGRESS   {achieved}/5"
+        if is_tracking
+        else "TARGET PROGRESS   NOT TRACKED"
+    )
+    draw.text((75, 930), progress_label, font=bot._font(24, True), fill=white)
     progress_points = [105, 315, 525, 735, 945]
     draw.line((105, 990, 945, 990), fill=(93, 111, 126), width=5)
     for index, x in enumerate(progress_points):
@@ -1254,20 +1934,40 @@ def render_trade_card(state):
         draw.text((x - 20, 1028), f"T{index + 1}", font=bot._font(20, True), fill=white)
 
     draw.rounded_rectangle((70, 1085, 1010, 1355), radius=24, fill=detail_panel)
+    delta = state.get("delta")
+    iv = state.get("iv")
+    delta_text = "—" if delta in (None, "") else f"{bot.safe_float(delta):+.2f}"
+    iv_value = bot.safe_float(iv)
+    iv_text = (
+        "—"
+        if iv in (None, "")
+        else f"{(iv_value if iv_value > 3 else iv_value * 100):.1f}%"
+    )
     details = [
-        ("TICKER", symbol),
+        (
+            "MACD DIRECTION" if state.get("entry_signal_type") == "MACD_5M" else "TICKER",
+            f"120/180/40 | 5m | {'GREEN' if direction == 'CALL' else 'RED'}"
+            if state.get("entry_signal_type") == "MACD_5M" else symbol,
+        ),
         ("EXPIRATION", f"{state['expiration']} ({dte}DTE)"),
         ("STRIKE", f"${bot.safe_float(state['strike']):.2f}"),
         ("CONTRACT TYPE", direction),
         ("CONTRACT", contract),
-        ("GAMMA FLIP", gamma_flip),
-        ("GAMMA STATUS", gamma_status),
+        ("DELTA", delta_text),
+        ("IMPLIED VOLATILITY", iv_text),
     ]
-    detail_y = 1100
+    if gamma_flip is not None:
+        details.extend(
+            [
+                ("MODELED GAMMA FLIP", gamma_flip),
+                ("GAMMA STATUS (INFO)", gamma_status),
+            ]
+        )
+    detail_y = 1094
     for label, value in details:
-        draw.text((105, detail_y), label, font=bot._font(19, True), fill=muted)
+        draw.text((105, detail_y), label, font=bot._font(17, True), fill=muted)
         value_text = str(value)
-        value_font = _card_fitted_font(draw, value_text, 20, 610, 14, True)
+        value_font = _card_fitted_font(draw, value_text, 19, 610, 13, True)
         bounds = draw.textbbox((0, 0), value_text, font=value_font)
         draw.text(
             (975 - (bounds[2] - bounds[0]), detail_y),
@@ -1275,11 +1975,18 @@ def render_trade_card(state):
             font=value_font,
             fill=white,
         )
-        detail_y += 34
+        detail_y += 28
 
+    tracking_update = is_tracking
+    quote_time = (
+        state.get("last_successful_option_price_update")
+        if tracking_update
+        else state.get("entry_quote_timestamp") or state.get("created_at")
+    )
+    quote_label = "Quote update" if tracking_update else "Quote snapshot"
     draw.text(
         (75, 1392),
-        f"Entry {bot.format_entry_time_et(state.get('created_at'))}",
+        f"{quote_label} {bot.format_entry_time_et(quote_time)}",
         font=bot._font(19),
         fill=muted,
     )
@@ -1468,8 +2175,722 @@ def _massive_rate_limit_delay(response):
     )
 
 
+def _provider_is_tradier():
+    return DATA_PROVIDER in ("tradier", "tradier_live")
+
+
+def _provider_is_thetadata():
+    return DATA_PROVIDER in ("thetadata", "theta", "thetadata_live")
+
+
+def _provider_is_marketdata():
+    return DATA_PROVIDER in ("marketdata", "marketdata_app", "marketdata_live")
+
+
+def _provider_token():
+    if _provider_is_tradier():
+        return bot.env("TRADIER_TOKEN")
+    if _provider_is_thetadata():
+        return bot.env("THETADATA_API_KEY")
+    if _provider_is_marketdata():
+        return bot.env("MARKETDATA_API_KEY")
+    return bot.env("MASSIVE_API_KEY")
+
+
+def _marketdata_account_credit_limit_reason():
+    with _MARKETDATA_CREDIT_LIMIT_LOCK:
+        return _MARKETDATA_CREDIT_LIMIT_REASON
+
+
+def _latch_marketdata_account_credit_limit(reason):
+    global _MARKETDATA_CREDIT_LIMIT_REASON
+    with _MARKETDATA_CREDIT_LIMIT_LOCK:
+        if not _MARKETDATA_CREDIT_LIMIT_REASON:
+            _MARKETDATA_CREDIT_LIMIT_REASON = str(reason)
+        return _MARKETDATA_CREDIT_LIMIT_REASON
+
+
+def _marketdata_error(response, endpoint):
+    """Keep MarketData failures actionable without logging credentials."""
+    text = (getattr(response, "text", "") or "").strip().replace("\n", " ")
+    return (
+        f"MARKETDATA_HTTP_{getattr(response, 'status_code', 'UNKNOWN')} "
+        f"{endpoint}: {text[:240] or 'empty response'}"
+    )
+
+
+def _marketdata_get(endpoint, params=None):
+    """Fetch MarketData JSON and accept 203 cached responses as successful."""
+    blocked_reason = _marketdata_account_credit_limit_reason()
+    if blocked_reason:
+        raise MarketDataAccountCreditLimitError(
+            f"MarketData account credit limit remains blocked: {blocked_reason}"
+        )
+
+    token = bot.env("MARKETDATA_API_KEY")
+    if not token:
+        raise RuntimeError("MARKETDATA_API_KEY is missing")
+    response = requests.get(
+        f"{MARKETDATA_BASE_URL}{endpoint}",
+        params=dict(params or {}),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+        timeout=MARKETDATA_REQUEST_TIMEOUT,
+    )
+    if response.status_code not in (200, 203):
+        error_message = _marketdata_error(response, endpoint)
+        response_text = (
+            getattr(response, "text", "") or ""
+        ).casefold()
+        if (
+            response.status_code == 429
+            and "credit limit" in response_text
+        ):
+            blocked_reason = _latch_marketdata_account_credit_limit(
+                error_message
+            )
+            raise MarketDataAccountCreditLimitError(blocked_reason)
+        raise RuntimeError(error_message)
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise RuntimeError(f"MARKETDATA_INVALID_JSON {endpoint}") from error
+    if not isinstance(payload, dict) or payload.get("s") not in (None, "ok"):
+        status = payload.get("s") if isinstance(payload, dict) else "unknown"
+        raise RuntimeError(f"MARKETDATA_RESPONSE_{status} {endpoint}")
+    return payload
+
+
+def _marketdata_column(payload, key, index, default=None):
+    values = (payload or {}).get(key)
+    if isinstance(values, list) and index < len(values):
+        return values[index]
+    return default
+
+
+def _marketdata_expiration(value):
+    if isinstance(value, str) and len(value) == 10 and value[4] == "-":
+        return value
+    timestamp = _unix_seconds(value)
+    if timestamp is None:
+        return ""
+    return bot.datetime.fromtimestamp(timestamp, bot.NEW_YORK_TZ).date().isoformat()
+
+
+def _marketdata_records(payload):
+    """Translate MarketData columnar option responses to the bot's shape."""
+    symbols = (payload or {}).get("optionSymbol")
+    if not isinstance(symbols, list):
+        return []
+
+    records = []
+    for index, option_symbol in enumerate(symbols):
+        ticker = bot.canonical_option_ticker(option_symbol)
+        if not ticker:
+            continue
+        side = str(_marketdata_column(payload, "side", index, "") or "").lower()
+        if side not in ("call", "put"):
+            side = "call" if "C" in ticker[-9:] else "put"
+        expiration = _marketdata_expiration(
+            _marketdata_column(payload, "expiration", index)
+        )
+        strike = _present_number(_marketdata_column(payload, "strike", index))
+        updated = _marketdata_column(payload, "updated", index)
+        last = _marketdata_column(payload, "last", index)
+        records.append({
+            "details": {
+                "ticker": ticker,
+                "expiration_date": expiration,
+                "strike_price": strike,
+                "contract_type": side,
+            },
+            "last_quote": {
+                "bid": _marketdata_column(payload, "bid", index),
+                "ask": _marketdata_column(payload, "ask", index),
+                "last_updated": updated,
+            },
+            "last_trade": {
+                "price": last,
+                "timestamp": updated,
+            },
+            "day": {
+                "volume": _marketdata_column(payload, "volume", index),
+                "close": last,
+                "open": None,
+            },
+            "open_interest": _marketdata_column(payload, "openInterest", index),
+            "implied_volatility": _marketdata_column(payload, "iv", index),
+            "greeks": {
+                "delta": _marketdata_column(payload, "delta", index),
+                "gamma": _marketdata_column(payload, "gamma", index),
+                "theta": _marketdata_column(payload, "theta", index),
+                "vega": _marketdata_column(payload, "vega", index),
+            },
+            "underlying_price": _marketdata_column(
+                payload, "underlyingPrice", index
+            ),
+        })
+    return records
+
+
+def _marketdata_raw_chain(symbol):
+    symbol = str(symbol or "").upper().strip()
+    today = bot.now_new_york().date()
+    expiration_from = (today + timedelta(days=SCORE_MIN_DTE)).isoformat()
+    expiration_to = (today + timedelta(days=SCORE_MAX_DTE)).isoformat()
+    cache_key = (
+        "marketdata", symbol, expiration_from, expiration_to
+    )
+    now = time.monotonic()
+    with _MASSIVE_CHAIN_CACHE_LOCK:
+        cached = _MASSIVE_CHAIN_CACHE.get(cache_key)
+        if (
+            isinstance(cached, dict)
+            and now - cached["timestamp"] <= MARKETDATA_CHAIN_CACHE_TTL_SECONDS
+        ):
+            return list(cached["results"])
+
+    payload = _marketdata_get(
+        f"/v1/options/chain/{symbol}/",
+        params={"from": expiration_from, "to": expiration_to},
+    )
+    records = _marketdata_records(payload)
+    with _MASSIVE_CHAIN_CACHE_LOCK:
+        _MASSIVE_CHAIN_CACHE[cache_key] = {
+            "timestamp": time.monotonic(),
+            "results": list(records),
+        }
+    return records
+
+
+def _marketdata_chain(symbol, direction):
+    wanted = "call" if str(direction).upper() == "CALL" else "put"
+    return [
+        record for record in _marketdata_raw_chain(symbol)
+        if (record.get("details") or {}).get("contract_type") == wanted
+        and _contract_in_dte_window(
+            (record.get("details") or {}).get("expiration_date")
+        )
+    ]
+
+
+def _marketdata_contract_snapshot(symbol, contract_ticker):
+    canonical = bot.canonical_option_ticker(contract_ticker)
+    payload = _marketdata_get(f"/v1/options/quotes/{canonical}/")
+    records = _marketdata_records(payload)
+    if not records:
+        raise RuntimeError(
+            f"MARKETDATA option quote unavailable for {symbol} {contract_ticker}"
+        )
+    return {"results": [records[0]]}
+
+
+def _marketdata_underlying_price(symbol, call_raw, put_raw):
+    for record in list(call_raw or []) + list(put_raw or []):
+        price = _present_number(record.get("underlying_price"))
+        if price is not None and price > 0:
+            return price, "marketdata_underlying_price"
+    price, source = _infer_underlying_with_parity(call_raw, put_raw)
+    return price, source
+
+
+def _thetadata_error(response, endpoint):
+    text = (getattr(response, "text", "") or "").strip().replace("\n", " ")
+    return (
+        f"THETADATA_HTTP_{getattr(response, 'status_code', 'UNKNOWN')} "
+        f"{endpoint}: {text[:240] or 'empty response'}"
+    )
+
+
+def _thetadata_get(endpoint, params=None):
+    """Call the local Theta Terminal; its API key is consumed by the terminal."""
+    if not bot.env("THETADATA_API_KEY"):
+        raise RuntimeError("THETADATA_API_KEY is missing")
+    query = dict(params or {})
+    query.setdefault("format", "json")
+    response = requests.get(
+        f"{THETADATA_BASE_URL}{endpoint}",
+        params=query,
+        headers={"Accept": "application/json"},
+        timeout=THETADATA_REQUEST_TIMEOUT,
+    )
+    if not response.ok:
+        raise RuntimeError(_thetadata_error(response, endpoint))
+    try:
+        return response.json()
+    except ValueError as error:
+        raise RuntimeError(f"THETADATA_INVALID_JSON {endpoint}") from error
+
+
+def _theta_expiration_date(value):
+    text = str(value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text
+
+
+def _theta_record_key(record):
+    record = record if isinstance(record, dict) else {}
+    expiration = _theta_expiration_date(record.get("expiration"))
+    strike = _present_number(record.get("strike"))
+    right = str(record.get("right") or "").lower()
+    if not expiration or strike is None or right not in ("call", "put"):
+        return None
+    return expiration, round(strike, 6), right
+
+
+def _theta_occ_ticker(symbol, expiration, right, strike):
+    expiry = bot.datetime.strptime(
+        _theta_expiration_date(expiration), "%Y-%m-%d"
+    )
+    right_code = "C" if str(right).lower() == "call" else "P"
+    strike_field = str(int(round(float(strike) * 1000))).zfill(8)
+    return (
+        f"{str(symbol).upper().replace('/', '.')}{expiry:%y%m%d}"
+        f"{right_code}{strike_field}"
+    )
+
+
+def _thetadata_expirations(symbol):
+    symbol = str(symbol or "").upper().strip()
+    now = time.monotonic()
+    with _THETADATA_EXPIRATION_CACHE_LOCK:
+        cached = _THETADATA_EXPIRATION_CACHE.get(symbol)
+        if cached and now - cached["timestamp"] <= 300:
+            return list(cached["dates"])
+    payload = _thetadata_get(
+        "/v3/option/list/expirations", {"symbol": symbol}
+    )
+    dates = sorted({
+        _theta_expiration_date(item.get("expiration"))
+        for item in _as_list(payload)
+        if isinstance(item, dict) and item.get("expiration")
+    })
+    with _THETADATA_EXPIRATION_CACHE_LOCK:
+        _THETADATA_EXPIRATION_CACHE[symbol] = {
+            "timestamp": time.monotonic(),
+            "dates": list(dates),
+        }
+    return dates
+
+
+def _thetadata_raw_chain(symbol):
+    """Merge Theta quote, OHLC, OI, and Greeks snapshots by contract identity."""
+    cache_key = ("thetadata", str(symbol).upper().strip())
+    now = time.monotonic()
+    with _MASSIVE_CHAIN_CACHE_LOCK:
+        cached = _MASSIVE_CHAIN_CACHE.get(cache_key)
+        if (
+            isinstance(cached, dict)
+            and now - cached["timestamp"] <= MASSIVE_CHAIN_CACHE_TTL_SECONDS
+        ):
+            return list(cached["results"])
+
+    symbol = str(symbol or "").upper().strip()
+    allowed = set()
+    today = bot.now_new_york().date()
+    for expiration in _thetadata_expirations(symbol):
+        try:
+            expiry = bot.datetime.strptime(
+                expiration, "%Y-%m-%d"
+            ).date()
+        except (TypeError, ValueError):
+            continue
+        if SCORE_MIN_DTE <= (expiry - today).days <= SCORE_MAX_DTE:
+            allowed.add(expiration)
+        if len(allowed) >= THETADATA_MAX_EXPIRATIONS:
+            break
+
+    common = {
+        "symbol": symbol,
+        "expiration": "*",
+        "right": "both",
+        "max_dte": SCORE_MAX_DTE,
+    }
+    quote_rows = _as_list(
+        _thetadata_get("/v3/option/snapshot/quote", common)
+    )
+    ohlc_rows = _as_list(
+        _thetadata_get("/v3/option/snapshot/ohlc", common)
+    )
+    oi_rows = _as_list(
+        _thetadata_get("/v3/option/snapshot/open_interest", common)
+    )
+    greek_rows = _as_list(
+        _thetadata_get("/v3/option/snapshot/greeks/first_order", common)
+    )
+
+    by_key = {}
+    for group_name, rows in (
+        ("quote", quote_rows),
+        ("ohlc", ohlc_rows),
+        ("open_interest", oi_rows),
+        ("greeks", greek_rows),
+    ):
+        for row in rows:
+            key = _theta_record_key(row)
+            if key is None:
+                continue
+            expiration = key[0]
+            if expiration not in allowed:
+                continue
+            by_key.setdefault(key, {})[group_name] = row
+
+    records = []
+    for (expiration, strike, right), groups in by_key.items():
+        quote = groups.get("quote") or {}
+        ohlc = groups.get("ohlc") or {}
+        oi = groups.get("open_interest") or {}
+        greeks = groups.get("greeks") or {}
+        ticker = _theta_occ_ticker(symbol, expiration, right, strike)
+        quote_time = quote.get("timestamp")
+        trade_time = ohlc.get("timestamp") or quote_time
+        records.append({
+            "details": {
+                "ticker": ticker,
+                "expiration_date": expiration,
+                "strike_price": strike,
+                "contract_type": right,
+            },
+            "last_quote": {
+                "bid": quote.get("bid"),
+                "ask": quote.get("ask"),
+                "last_updated": quote_time,
+            },
+            "last_trade": {
+                "price": ohlc.get("close"),
+                "timestamp": trade_time,
+            },
+            "day": {
+                "volume": ohlc.get("volume"),
+                "close": ohlc.get("close"),
+                "open": ohlc.get("open"),
+            },
+            "open_interest": oi.get("open_interest"),
+            "implied_volatility": (
+                greeks.get("implied_vol")
+                if greeks.get("implied_vol") is not None
+                else greeks.get("iv")
+            ),
+            "greeks": {
+                "delta": greeks.get("delta"),
+                "theta": greeks.get("theta"),
+            },
+        })
+    with _MASSIVE_CHAIN_CACHE_LOCK:
+        _MASSIVE_CHAIN_CACHE[cache_key] = {
+            "timestamp": time.monotonic(),
+            "results": list(records),
+        }
+    return records
+
+
+def _thetadata_chain(symbol, direction):
+    wanted = "call" if str(direction).upper() == "CALL" else "put"
+    return [
+        record for record in _thetadata_raw_chain(symbol)
+        if (record.get("details") or {}).get("contract_type") == wanted
+    ]
+
+
+def _theta_contract_parts(contract_ticker):
+    canonical = bot.canonical_option_ticker(contract_ticker)
+    match = bot.re.fullmatch(
+        r"([A-Z.\-]+)(\d{6})([CP])(\d{8})", canonical
+    )
+    if not match:
+        raise ValueError(f"invalid canonical option ticker: {contract_ticker}")
+    root, yymmdd, right, strike_field = match.groups()
+    expiration = f"20{yymmdd[:2]}-{yymmdd[2:4]}-{yymmdd[4:6]}"
+    return (
+        root.replace(".", "/"),
+        expiration,
+        "call" if right == "C" else "put",
+        int(strike_field) / 1000.0,
+    )
+
+
+def _thetadata_contract_snapshot(symbol, contract_ticker):
+    root, expiration, right, strike = _theta_contract_parts(contract_ticker)
+    params = {
+        "symbol": root,
+        "expiration": expiration,
+        "right": right,
+        "strike": f"{strike:.3f}",
+    }
+    quote_rows = _as_list(
+        _thetadata_get("/v3/option/snapshot/quote", params)
+    )
+    ohlc_rows = _as_list(
+        _thetadata_get("/v3/option/snapshot/ohlc", params)
+    )
+    quote = quote_rows[0] if quote_rows else {}
+    ohlc = ohlc_rows[0] if ohlc_rows else {}
+    if not quote and not ohlc:
+        raise RuntimeError(
+            f"THETADATA option quote unavailable for {symbol} {contract_ticker}"
+        )
+    return {
+        "results": [{
+            "details": {
+                "ticker": bot.canonical_option_ticker(contract_ticker),
+                "expiration_date": expiration,
+                "strike_price": strike,
+            },
+            "last_quote": {
+                "bid": quote.get("bid"),
+                "ask": quote.get("ask"),
+                "last_updated": quote.get("timestamp"),
+            },
+            "last_trade": {
+                "price": ohlc.get("close"),
+                "timestamp": ohlc.get("timestamp"),
+            },
+            "day": {
+                "open": ohlc.get("open"),
+                "close": ohlc.get("close"),
+                "volume": ohlc.get("volume"),
+            },
+        }],
+    }
+
+
+def _thetadata_underlying_price(symbol):
+    rows = _as_list(_thetadata_get(
+        "/v3/stock/snapshot/quote", {"symbol": symbol}
+    ))
+    for row in rows:
+        bid = _present_number(row.get("bid"))
+        ask = _present_number(row.get("ask"))
+        if bid is not None and ask is not None and bid > 0 and ask >= bid:
+            return (bid + ask) / 2.0, "thetadata_quote_midpoint"
+        for value in (bid, ask):
+            if value is not None and value > 0:
+                return value, "thetadata_quote_side"
+    raise RuntimeError(
+        f"THETADATA underlying quote unavailable for {symbol}"
+    )
+
+
+def _tradier_error(response, endpoint):
+    text = (getattr(response, "text", "") or "").strip().replace("\n", " ")
+    return (
+        f"TRADIER_HTTP_{getattr(response, 'status_code', 'UNKNOWN')} "
+        f"{endpoint}: {text[:240] or 'empty response'}"
+    )
+
+
+def _tradier_get(endpoint, params=None):
+    token = bot.env("TRADIER_TOKEN")
+    if not token:
+        raise RuntimeError("TRADIER_TOKEN is missing")
+    response = requests.get(
+        f"{TRADIER_BASE_URL}{endpoint}",
+        params=dict(params or {}),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+        timeout=TRADIER_REQUEST_TIMEOUT,
+    )
+    if not response.ok:
+        raise RuntimeError(_tradier_error(response, endpoint))
+    try:
+        return response.json()
+    except ValueError as error:
+        raise RuntimeError(f"TRADIER_INVALID_JSON {endpoint}") from error
+
+
+def _as_list(value):
+    """Normalize Tradier's one-item object versus array response behavior."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _tradier_expirations(symbol):
+    symbol = str(symbol or "").upper().strip()
+    now = time.monotonic()
+    with _TRADIER_EXPIRATION_CACHE_LOCK:
+        cached = _TRADIER_EXPIRATION_CACHE.get(symbol)
+        if cached and now - cached["timestamp"] <= 300:
+            return list(cached["dates"])
+
+    payload = _tradier_get(
+        "/v1/markets/options/expirations",
+        {"symbol": symbol, "includeAllRoots": "true"},
+    )
+    dates = ((payload or {}).get("expirations") or {}).get("date") or []
+    dates = [str(value) for value in _as_list(dates) if value]
+    dates.sort()
+    with _TRADIER_EXPIRATION_CACHE_LOCK:
+        _TRADIER_EXPIRATION_CACHE[symbol] = {
+            "timestamp": time.monotonic(),
+            "dates": list(dates),
+        }
+    return dates
+
+
+def _tradier_record(option):
+    """Translate one Tradier option record to the existing internal shape."""
+    option = option if isinstance(option, dict) else {}
+    greeks = option.get("greeks") or {}
+    option_type = str(
+        option.get("option_type") or option.get("type") or ""
+    ).lower()
+    quote_stamp = max(
+        (
+            _unix_seconds(option.get("bid_date")) or 0,
+            _unix_seconds(option.get("ask_date")) or 0,
+        ),
+        default=0,
+    )
+    trade_stamp = _unix_seconds(option.get("trade_date"))
+    return {
+        "details": {
+            "ticker": option.get("symbol") or "",
+            "expiration_date": option.get("expiration_date") or "",
+            "strike_price": option.get("strike"),
+            "contract_type": option_type,
+        },
+        "last_quote": {
+            "bid": option.get("bid"),
+            "ask": option.get("ask"),
+            "last_updated": quote_stamp or None,
+        },
+        "last_trade": {
+            "price": option.get("last"),
+            "timestamp": trade_stamp,
+        },
+        "day": {
+            "volume": option.get("volume"),
+            "close": option.get("close"),
+            "open": option.get("open"),
+        },
+        "open_interest": option.get("open_interest"),
+        "implied_volatility": (
+            greeks.get("mid_iv")
+            if greeks.get("mid_iv") is not None
+            else greeks.get("iv")
+        ),
+        "greeks": {
+            "delta": greeks.get("delta"),
+            "theta": greeks.get("theta"),
+        },
+    }
+
+
+def _tradier_chain(symbol, direction):
+    """Fetch near-term Tradier chains once and expose CALL/PUT separately."""
+    symbol = str(symbol or "").upper().strip()
+    direction = str(direction or "").upper().strip()
+    cache_key = ("tradier", symbol, "ALL")
+    now = time.monotonic()
+    with _MASSIVE_CHAIN_CACHE_LOCK:
+        cached = _MASSIVE_CHAIN_CACHE.get(cache_key)
+        if (
+            isinstance(cached, dict)
+            and now - cached["timestamp"] <= MASSIVE_CHAIN_CACHE_TTL_SECONDS
+        ):
+            records = list(cached["results"])
+        else:
+            records = None
+
+    if records is None:
+        today = bot.now_new_york().date()
+        dates = []
+        for expiration in _tradier_expirations(symbol):
+            try:
+                expiry = bot.datetime.strptime(
+                    expiration, "%Y-%m-%d"
+                ).date()
+            except (TypeError, ValueError):
+                continue
+            dte = (expiry - today).days
+            if SCORE_MIN_DTE <= dte <= SCORE_MAX_DTE:
+                dates.append(expiration)
+            if len(dates) >= TRADIER_MAX_EXPIRATIONS:
+                break
+        records = []
+        for expiration in dates:
+            payload = _tradier_get(
+                "/v1/markets/options/chains",
+                {
+                    "symbol": symbol,
+                    "expiration": expiration,
+                    "greeks": "true",
+                },
+            )
+            options = ((payload or {}).get("options") or {}).get("option") or []
+            records.extend(
+                _tradier_record(option) for option in _as_list(options)
+            )
+        with _MASSIVE_CHAIN_CACHE_LOCK:
+            _MASSIVE_CHAIN_CACHE[cache_key] = {
+                "timestamp": time.monotonic(),
+                "results": list(records),
+            }
+
+    wanted = "call" if direction == "CALL" else "put"
+    return [
+        record for record in records
+        if str(
+            (record.get("details") or {}).get("contract_type") or ""
+        ).lower() == wanted
+    ]
+
+
+def _tradier_quote_record(symbol):
+    payload = _tradier_get(
+        "/v1/markets/quotes",
+        {"symbols": str(symbol or "").strip(), "greeks": "true"},
+    )
+    quote = ((payload or {}).get("quotes") or {}).get("quote") or {}
+    return quote if isinstance(quote, dict) else {}
+
+
+def _tradier_underlying_price(symbol):
+    quote = _tradier_quote_record(symbol)
+    price = _present_number(
+        quote.get("last")
+        if quote.get("last") is not None
+        else quote.get("close")
+    )
+    if price is None or price <= 0:
+        raise RuntimeError(f"TRADIER underlying quote unavailable for {symbol}")
+    return price, "tradier_quote"
+
+
+def _tradier_contract_snapshot(symbol, contract_ticker):
+    quote = _tradier_quote_record(contract_ticker)
+    if not quote:
+        raise RuntimeError(
+            f"TRADIER option quote unavailable for {symbol} {contract_ticker}"
+        )
+    return {"results": [_tradier_record(quote)]}
+
+
+def provider_contract_snapshot(symbol, contract_ticker):
+    """Return the selected contract snapshot through the configured provider."""
+    if _provider_is_thetadata():
+        return _thetadata_contract_snapshot(symbol, contract_ticker)
+    if _provider_is_tradier():
+        return _tradier_contract_snapshot(symbol, contract_ticker)
+    if _provider_is_marketdata():
+        return _marketdata_contract_snapshot(symbol, contract_ticker)
+    return _ORIGINAL_MASSIVE_CONTRACT_SNAPSHOT(symbol, contract_ticker)
+
+
 def massive_chain(symbol, direction):
     """Fetch a chain with short caching and explicit rate-limit protection."""
+    if _provider_is_thetadata():
+        return _filter_contracts_by_dte(_thetadata_chain(symbol, direction))
+    if _provider_is_tradier():
+        return _filter_contracts_by_dte(_tradier_chain(symbol, direction))
+    if _provider_is_marketdata():
+        return _filter_contracts_by_dte(_marketdata_chain(symbol, direction))
     global _MASSIVE_BACKOFF_UNTIL, _UNDERLYING_PRICE_BACKOFF_UNTIL
     api_key = bot.env("MASSIVE_API_KEY")
     if not api_key:
@@ -1489,7 +2910,7 @@ def massive_chain(symbol, direction):
                 f"{symbol} {direction} chain source: cache "
                 f"age={now_monotonic - cached['timestamp']:.1f}s"
             )
-            return list(cached["results"])
+            return _filter_contracts_by_dte(list(cached["results"]))
 
     if now_monotonic < _MASSIVE_BACKOFF_UNTIL:
         remaining = max(0.0, _MASSIVE_BACKOFF_UNTIL - now_monotonic)
@@ -1540,6 +2961,7 @@ def massive_chain(symbol, direction):
         url = str(next_url)
         params = {"apiKey": api_key}
 
+    results = _filter_contracts_by_dte(results)
     with _MASSIVE_CHAIN_CACHE_LOCK:
         _MASSIVE_CHAIN_CACHE[cache_key] = {
             "timestamp": time.monotonic(),
@@ -1609,8 +3031,75 @@ def _massive_stock_get(path, api_key, params=None):
     return response.json()
 
 
+def _fetch_macd_5m_direction(symbol, now=None):
+    """TradingView alone supplies direction; never fall back to delayed candles."""
+    now = now or bot.now_new_york()
+    symbol = str(symbol).upper().strip()
+    boundary = int(now.timestamp()) // 300 * 300 - 300
+    with _MACD_CACHE_LOCK:
+        cached = _MACD_CACHE.get(symbol)
+        if (
+            cached and cached["bar_time_ms"] == boundary * 1000
+            and cached.get("source") == "tradingview_closed_bar"
+        ):
+            return dict(cached)
+    raise macd_direction.MacdDataError("Waiting for the latest closed 5-minute MACD candle from TradingView")
+
+
+def _fetch_bot_ichimoku_30m_signal(symbol, now=None):
+    """Fetch and calculate a fresh 30-minute crossing without a webhook."""
+    symbol = str(symbol or "").upper().strip()
+    api_key = bot.env("MASSIVE_API_KEY")
+    if not api_key:
+        return None, "MASSIVE_API_KEY is not configured"
+    if not symbol or symbol not in bot.WATCHLIST:
+        return None, "ticker is not in the ORCA watchlist"
+    if symbol in bot.EXCLUDED_SYMBOLS:
+        return None, "ticker is excluded from contract selection"
+
+    now = now or bot.now_new_york()
+    try:
+        end_date = now.date()
+        start_date = end_date - timedelta(days=30)
+        payload = _massive_stock_get(
+            f"/v2/aggs/ticker/{symbol}/range/30/minute/"
+            f"{start_date.isoformat()}/{end_date.isoformat()}",
+            api_key,
+            {"adjusted": "true", "sort": "asc", "limit": 5000},
+        )
+        if not isinstance(payload, dict):
+            return None, "Massive returned an invalid aggregate response"
+        if str(payload.get("status") or "").upper() == "DELAYED":
+            return None, "Massive explicitly marked the aggregate feed delayed"
+        bars = payload.get("results")
+        signal = _ichimoku_30m_signal_from_bars(
+            symbol, bars, now=now
+        )
+        return signal, None if signal else "no crossing on the latest completed bar"
+    except Exception as error:
+        safe_error = str(error).replace(api_key, "[redacted]")
+        return None, f"30-minute aggregate check failed: {safe_error[:300]}"
+
+
+def _poll_and_register_bot_ichimoku_signal(symbol, now=None):
+    """Register a fresh bot-calculated crossing in the durable signal store."""
+    payload, error = _fetch_bot_ichimoku_30m_signal(symbol, now=now)
+    if error or not payload:
+        return None, error or "no fresh bot-calculated signal"
+    try:
+        return _register_ichimoku_30m_signal(payload, now=now)
+    except ValueError as error:
+        return None, str(error)
+
+
 def fetch_underlying_price(symbol, call_raw, put_raw):
     """Use a cached/latest minute aggregate, retaining option inference as fallback."""
+    if _provider_is_thetadata():
+        return _thetadata_underlying_price(symbol)
+    if _provider_is_tradier():
+        return _tradier_underlying_price(symbol)
+    if _provider_is_marketdata():
+        return _marketdata_underlying_price(symbol, call_raw, put_raw)
     global _UNDERLYING_PRICE_BACKOFF_UNTIL, _MASSIVE_BACKOFF_UNTIL
     symbol = str(symbol or "").upper().strip()
     api_key = bot.env("MASSIVE_API_KEY")
@@ -1706,20 +3195,14 @@ def fetch_underlying_price(symbol, call_raw, put_raw):
 
 
 def _gamma_t_years(expiration, now):
-    """Return near-term expiry time using New York dates and 0DTE session time."""
+    """Return expiry time only for contracts inside the 10-30 DTE window."""
     try:
         expiry = bot.datetime.strptime(str(expiration), "%Y-%m-%d").date()
     except (TypeError, ValueError):
         return None, None
     dte = (expiry - now.date()).days
-    if dte < 0 or dte > GAMMA_MAX_DTE:
+    if dte < SCORE_MIN_DTE or dte > SCORE_MAX_DTE:
         return dte, None
-    if dte == 0:
-        remaining = max(
-            5.0,
-            (now.replace(hour=16, minute=0, second=0, microsecond=0) - now).total_seconds() / 60.0,
-        )
-        return dte, remaining / (365.0 * 24.0 * 60.0)
     return dte, max(dte, 0.25) / 365.0
 
 
@@ -1775,7 +3258,8 @@ def _prepare_gamma_universe(call_raw, put_raw, now=None):
         and stats["gamma_completeness_percent"] >= GAMMA_MIN_COMPLETENESS_PERCENT
         else "INSUFFICIENT"
     )
-    stats["gamma_max_dte"] = GAMMA_MAX_DTE
+    stats["gamma_min_dte"] = SCORE_MIN_DTE
+    stats["gamma_max_dte"] = SCORE_MAX_DTE
     return usable, stats
 
 
@@ -1975,17 +3459,17 @@ def _populate_gamma_card_fields(image_path, state):
 
 
 def nearest_expiration(contracts):
-    """Return the nearest expiration using the New York market date."""
-    today = bot.now_new_york().date()
+    """Return the nearest eligible expiration within the configured DTE window."""
+    now = bot.now_new_york()
     valid = []
 
     for contract in contracts:
         try:
-            expiration = bot.datetime.strptime(
-                contract["expiration"], "%Y-%m-%d"
-            ).date()
-            if expiration >= today:
-                valid.append(expiration)
+            expiration = contract["expiration"]
+            if _contract_in_dte_window(expiration, now):
+                valid.append(bot.datetime.strptime(
+                    expiration, "%Y-%m-%d"
+                ).date())
         except (KeyError, TypeError, ValueError):
             continue
 
@@ -1996,70 +3480,104 @@ def create_trade(
     symbol, direction, stock_price, contract=None, gamma_info=None,
     trade_confidence=None, gamma_direction=None, directional_edge=None,
     scan_mode=None, required_score=None, required_edge=None,
+    allow_strong_score_exception=False, macd_signal=None,
 ):
     """Lock and open the exact contract that qualified during the scan."""
     symbol = str(symbol or "").upper().strip()
     direction = str(direction or "").upper().strip()
+    if symbol in bot.EXCLUDED_SYMBOLS:
+        raise RuntimeError(f"{symbol} is excluded from contract selection")
     if bot.safe_float(stock_price) <= 0:
         raise RuntimeError("Underlying price unavailable; refusing to lock a contract")
+    macd_signal = _fetch_macd_5m_direction(symbol)
+    macd_direction.validate_direction(macd_signal, symbol, direction, bot.now_new_york())
+    if required_score is None:
+        required_score = _scan_mode_context()["required_score"]
     if contract is None:
-        # Manual /signal compatibility: select once through the canonical,
-        # fully-paginated path and calculate Gamma from that same full universe.
+        # Manual contract selection: use the canonical, fully-paginated path
+        # and calculate Gamma from that same full contract universe.
         call_raw = massive_chain(symbol, "CALL")
         put_raw = massive_chain(symbol, "PUT")
         if gamma_info is None:
-            gamma_info = calculate_gamma_flip(call_raw, put_raw, stock_price)
+            try:
+                gamma_info = calculate_gamma_flip(call_raw, put_raw, stock_price)
+            except Exception:
+                gamma_info = {"status": "INSUFFICIENT DATA", "regime": "UNAVAILABLE"}
         calls, _ = _prepare_side(call_raw, stock_price)
         puts, _ = _prepare_side(put_raw, stock_price)
+        with bot.TRADE_STATE_LOCK:
+            used_tickers = _existing_contract_tickers(
+                bot._load_trade_store(), symbol
+            )
+        calls = _exclude_recorded_contracts(calls, used_tickers)
+        puts = _exclude_recorded_contracts(puts, used_tickers)
         call_stats, put_stats = _side_flow_stats(calls), _side_flow_stats(puts)
-        call_strength = bot._direction_strength(call_stats, put_stats)
-        put_strength = bot._direction_strength(put_stats, call_stats)
         requested = calls if direction == "CALL" else puts
         contract = requested[0] if requested else None
-        direction_edge = (
-            call_strength - put_strength
-            if direction == "CALL" else put_strength - call_strength
+        assessment = _macd_contract_assessment(
+            direction, contract, gamma_info, stock_price, required_score
         )
-        assessment = _conservative_assessment(
-            direction, contract, direction_edge, gamma_info, stock_price
-        )
-        if ORCA_CONSERVATIVE_MODE and not assessment["can_open"]:
+        if not assessment["can_open"]:
             raise RuntimeError(assessment["wait_status"])
         trade_confidence = assessment["trade_confidence"]
         gamma_direction = assessment["gamma_direction_state"]
     if not isinstance(contract, dict) or not contract.get("ticker"):
         raise RuntimeError("Qualified contract is missing")
+    trade_key = _trade_storage_key(symbol, contract["ticker"])
 
     with bot.TRADE_STATE_LOCK:
         store = bot._load_trade_store()
         trades = store.setdefault("trades", {})
-        existing = trades.get(symbol)
-        if isinstance(existing, dict) and existing.get("status") in (
-            "opening", "active", "recovery_required"
-        ):
+        _, existing = _find_trade_entry(store, symbol, contract["ticker"])
+        if isinstance(existing, dict):
             result = dict(existing)
             result["_ignored_duplicate"] = True
             return result
         created_at = bot.now_new_york().isoformat(timespec="seconds")
-        reservation = {"symbol": symbol, "direction": direction, "stock_price": stock_price,
+        reservation = {"symbol": symbol, "trade_record_key": trade_key,
+                       "direction": direction, "stock_price": stock_price,
                        "contract_ticker": contract["ticker"], "entry_price": 0.0,
                        "status": "opening", "message_id": None, "created_at": created_at,
                         "monitor_version": 0, "opening_phase": "reserved"}
-        trades[symbol] = reservation
+        trades[trade_key] = reservation
         bot._save_trade_store(store)
     try:
+        contract = refresh_contract_quote_for_entry(
+            symbol, contract, stock_price
+        )
         entry, source = bot.choose_initial_price(contract)
-        if entry <= 0:
-            raise RuntimeError("Qualified contract has no usable option price")
+        assessment = _macd_contract_assessment(
+            direction, contract, gamma_info, stock_price, required_score,
+        )
+        if not assessment["can_open"]:
+            raise RuntimeError(assessment["wait_status"])
+        if entry <= 0 or source != "Fresh Bid/Ask Midpoint":
+            raise RuntimeError("WAIT - FRESH OPTION MIDPOINT REQUIRED")
+        # Re-check after quote retrieval: a new closed candle may have changed side.
+        macd_signal = _fetch_macd_5m_direction(symbol)
+        macd_direction.validate_direction(macd_signal, symbol, direction, bot.now_new_york())
+        trade_confidence = assessment["trade_confidence"]
+        gamma_direction = assessment["gamma_direction_state"]
+        quote_timestamp = contract.get("quote_timestamp")
+        quote_timestamp_iso = (
+            bot.datetime.fromtimestamp(
+                quote_timestamp, bot.NEW_YORK_TZ
+            ).isoformat(timespec="seconds")
+            if quote_timestamp is not None
+            else bot.now_new_york().isoformat(timespec="seconds")
+        )
         state = {
             "symbol": symbol, "direction": direction, "stock_price": stock_price,
+            "trade_record_key": trade_key,
             "contract_ticker": contract["ticker"], "expiration": contract["expiration"],
-            "strike": contract["strike"], "score": contract["score"], "entry_price": round(entry, 2),
+            "strike": contract["strike"], "score": contract["score"], "entry_price": round(entry, 3),
             "entry_source": source, "stop_loss": bot.stop_loss(entry), "targets": bot.targets(entry),
-            "current_price": round(entry, 2), "highest_price": round(entry, 2), "achieved": 0,
-            "lowest_price": round(entry, 2),
+            "current_price": round(entry, 3), "highest_price": round(entry, 3), "achieved": 0,
+            "lowest_price": round(entry, 3),
             "status": "active", "message_id": None, "created_at": created_at, "monitor_version": 1,
             "telegram_send_state": "not_started",
+            "entry_quote_timestamp": quote_timestamp_iso,
+            "entry_quote_age_seconds": contract.get("quote_age_seconds"),
             "dte": contract.get("dte"),
             "trade_confidence": (trade_confidence or {}).get("level", "N/A"),
             "trade_confidence_score": (trade_confidence or {}).get("score"),
@@ -2075,10 +3593,15 @@ def create_trade(
             "spread_percent": contract.get("spread_percent"),
             "iv": contract.get("iv"),
             "theta": contract.get("theta"),
-            "directional_edge": directional_edge,
+            "theta_delta_ratio": contract.get("theta_delta_ratio"),
+            "directional_edge": None,
             "scan_mode": scan_mode,
             "required_score": required_score,
-            "required_edge": required_edge,
+            "required_edge": None,
+            "entry_signal_type": "MACD_5M",
+            "entry_signal_bar_time_ms": macd_signal["bar_time_ms"],
+            "macd": dict(macd_signal),
+            "gamma_policy": "diagnostic_only",
             "gamma_direction_state": gamma_direction or gamma_direction_state(
                 direction, stock_price, gamma_info
             ),
@@ -2087,25 +3610,25 @@ def create_trade(
         }
         with bot.TRADE_STATE_LOCK:
             store = bot._load_trade_store()
-            current = (store.get("trades") or {}).get(symbol)
+            current = (store.get("trades") or {}).get(trade_key)
             if not isinstance(current, dict) or current.get("status") != "opening" or current.get("contract_ticker") != contract["ticker"]:
                 raise RuntimeError("opening trade changed before activation")
             # This durable checkpoint makes a subsequent send failure
             # unambiguous: it may have reached Telegram, so never resend it.
             state["telegram_send_state"] = "sending"
-            store["trades"][symbol] = state
+            store["trades"][trade_key] = state
             bot._save_trade_store(store)
         # Rendering and Telegram are intentionally outside TRADE_STATE_LOCK.
         message_id = bot.telegram_send_card(dict(state))
         with bot.TRADE_STATE_LOCK:
             store = bot._load_trade_store()
-            current = (store.get("trades") or {}).get(symbol)
+            current = (store.get("trades") or {}).get(trade_key)
             if not isinstance(current, dict) or current.get("contract_ticker") != contract["ticker"] or current.get("message_id"):
                 raise RuntimeError("active trade changed before Telegram synchronization")
             current["message_id"] = message_id
             current["telegram_send_state"] = "sent"
             current["monitor_version"] = int(current.get("monitor_version", 0)) + 1
-            store["trades"][symbol] = current
+            store["trades"][trade_key] = current
             store.setdefault("paper_trades", []).append(_paper_trade_record(current))
             (store.get("pending_candidates") or {}).pop(symbol, None)
             bot._save_trade_store(store)
@@ -2115,23 +3638,25 @@ def create_trade(
     except Exception:
         with bot.TRADE_STATE_LOCK:
             latest = bot._load_trade_store()
-            current = (latest.get("trades") or {}).get(symbol)
+            current = (latest.get("trades") or {}).get(trade_key)
             if isinstance(current, dict) and current.get("contract_ticker") == contract["ticker"] and not current.get("message_id"):
                 if current.get("opening_phase") == "reserved":
-                    latest["trades"].pop(symbol, None)
+                    latest["trades"].pop(trade_key, None)
                 else:
                     current.update(status="recovery_required",
                                    recovery_note="Telegram send may have succeeded; manual recovery required")
-                    latest["trades"][symbol] = current
+                    latest["trades"][trade_key] = current
                 bot._save_trade_store(latest)
         raise
 
 
-def _apply_monitored_price(symbol, identity, price, source, age, quote_age, trade_age):
+def _apply_monitored_price(
+    trade_key, symbol, identity, price, source, age, quote_age, trade_age
+):
     """Atomically apply an already-fetched exact-contract update."""
     with bot.TRADE_STATE_LOCK:
         store = bot._load_trade_store()
-        state = (store.get("trades") or {}).get(symbol)
+        state = (store.get("trades") or {}).get(trade_key)
         if not isinstance(state, dict) or state.get("status") != "active":
             return None
         current_identity = (
@@ -2164,17 +3689,17 @@ def _apply_monitored_price(symbol, identity, price, source, age, quote_age, trad
             last_trade_age_seconds=round(trade_age, 3) if trade_age is not None else None,
             monitor_version=int(state.get("monitor_version", 0)) + 1,
         )
-        store["trades"][symbol] = state
+        store["trades"][trade_key] = state
         _update_paper_trade(store, state, previous_achieved)
         bot._save_trade_store(store)
         return dict(state)
 
 
-def _record_telegram_sync(symbol, identity, success, error=None):
+def _record_telegram_sync(trade_key, identity, success, error=None):
     """Persist edit outcome only if this remains the exact original message."""
     with bot.TRADE_STATE_LOCK:
         store = bot._load_trade_store()
-        state = (store.get("trades") or {}).get(symbol)
+        state = (store.get("trades") or {}).get(trade_key)
         current_identity = (
             state.get("contract_ticker"),
             state.get("message_id"),
@@ -2191,7 +3716,7 @@ def _record_telegram_sync(symbol, identity, success, error=None):
             state["telegram_sync_pending"] = True
             state["telegram_sync_pending_count"] = int(state.get("telegram_sync_pending_count", 0)) + 1
             state["last_telegram_error"] = error or "Telegram edit retry exhausted"
-        store["trades"][symbol] = state
+        store["trades"][trade_key] = state
         bot._save_trade_store(store)
 
 
@@ -2199,17 +3724,19 @@ def monitor_active_trades_once():
     """Poll exact locked tickers without holding the state lock during I/O."""
     with bot.TRADE_STATE_LOCK:
         store = bot._load_trade_store()
-        work = [(symbol, (
+        work = [(trade_key, symbol, (
                     trade.get("contract_ticker"),
                     trade.get("message_id"),
                     int(trade.get("monitor_version", 0)),
                 ))
-                for symbol, trade in (store.get("trades") or {}).items()
-                if isinstance(trade, dict) and trade.get("status") == "active"]
+                for trade_key, symbol, trade in _iter_trade_entries(store)
+                if isinstance(trade, dict)
+                and trade.get("status") == "active"
+                and symbol not in bot.EXCLUDED_SYMBOLS]
     if not work:
         return {"accepted": True, "ignored": "no active trades"}
     results = []
-    for symbol, identity in work:
+    for trade_key, symbol, identity in work:
         contract, message_id, _ = identity
         if not contract:
             results.append({"accepted": False, "symbol": symbol, "error": "active trade missing contract"})
@@ -2218,7 +3745,10 @@ def monitor_active_trades_once():
             snapshot = bot.massive_contract_snapshot(symbol, contract)
             price, source, age, quote_age, trade_age = classify_snapshot_price(snapshot)
             if price > 0:
-                state = _apply_monitored_price(symbol, identity, price, source, age, quote_age, trade_age)
+                state = _apply_monitored_price(
+                    trade_key, symbol, identity, price, source, age,
+                    quote_age, trade_age,
+                )
                 if state is None:
                     results.append({"accepted": True, "symbol": symbol, "contract": contract,
                                     "ignored": "locked trade changed during poll"})
@@ -2232,7 +3762,7 @@ def monitor_active_trades_once():
                 # Do not overwrite a known price with old session/day values.
                 with bot.TRADE_STATE_LOCK:
                     latest = bot._load_trade_store()
-                    state = (latest.get("trades") or {}).get(symbol)
+                    state = (latest.get("trades") or {}).get(trade_key)
                     if isinstance(state, dict) and (
                         state.get("contract_ticker"), state.get("message_id"),
                         int(state.get("monitor_version", 0)),
@@ -2241,7 +3771,7 @@ def monitor_active_trades_once():
                                      last_data_age_seconds=round(age, 3) if age is not None else None,
                                      last_quote_age_seconds=round(quote_age, 3) if quote_age is not None else None,
                                      last_trade_age_seconds=round(trade_age, 3) if trade_age is not None else None)
-                        latest["trades"][symbol] = state
+                        latest["trades"][trade_key] = state
                         bot._save_trade_store(latest)
                         state = dict(state)
                     else:
@@ -2253,15 +3783,18 @@ def monitor_active_trades_once():
                 print(f"💹 {symbol} {contract} price=unchanged source={source} age={age}")
                 if isinstance(state, dict) and state.get("telegram_sync_pending") and message_id:
                     success, error = telegram_edit_card_retry(message_id, state)
-                    _record_telegram_sync(symbol, identity, success, error)
+                    _record_telegram_sync(trade_key, identity, success, error)
                 continue
+            # This monitor runs hourly. Keep the existing Telegram card's price
+            # fields current once per scheduled pass, rather than on every tick.
             success, error = telegram_edit_card_retry(message_id, state)
-            _record_telegram_sync(symbol, sync_identity, success, error)
+            _record_telegram_sync(trade_key, sync_identity, success, error)
             item = {"accepted": True, "symbol": symbol, "contract": contract, "price": price,
                     "source": source, "source_age_seconds": round(age, 3),
                     "quote_age_seconds": round(quote_age, 3) if quote_age is not None else None,
                     "trade_age_seconds": round(trade_age, 3) if trade_age is not None else None,
-                    "telegram_synchronized": success, "status": state.get("status")}
+                    "telegram_synchronized": success, "telegram_updated": True,
+                    "status": state.get("status")}
             results.append(item)
             print(f"💹 {symbol} {contract} price={price:.2f} source={source} age={age:.1f}s telegram={success}")
         except Exception as error:
@@ -2269,15 +3802,41 @@ def monitor_active_trades_once():
     return {"accepted": True, "active_checked": len(work), "results": results}
 
 
+def _seconds_until_next_hour(now=None, minimum_wait_seconds=0):
+    """Return delay to a wall-clock hour boundary, optionally after a minimum wait."""
+    now = now or bot.now_new_york()
+    earliest = now + timedelta(seconds=max(0.0, float(minimum_wait_seconds)))
+    boundary = earliest.replace(minute=0, second=0, microsecond=0)
+    if boundary < earliest or (minimum_wait_seconds <= 0 and boundary <= now):
+        boundary += timedelta(hours=1)
+    return max(0.0, (boundary - now).total_seconds())
+
+
 def auto_monitor_loop():
-    interval = max(float(getattr(bot, "AUTO_MONITOR_SECONDS", 5)), 0.1)
-    print(f"Auto contract monitor: every {interval:g}s")
+    if not AUTO_MONITOR_ENABLED:
+        print("Auto contract monitor disabled")
+        return
+    interval = max(float(getattr(bot, "AUTO_MONITOR_SECONDS", 3600)), 0.1)
+    hourly = interval >= 3600
+    if hourly:
+        first_delay = _seconds_until_next_hour()
+        print(
+            "Auto contract monitor: hourly on the hour; "
+            f"first update in {first_delay:.0f}s"
+        )
+        time.sleep(first_delay)
+    else:
+        print(f"Auto contract monitor: every {interval:g}s")
     while True:
         try:
-            monitor_active_trades_once()
+            if not hourly or bot.market_is_open_now():
+                monitor_active_trades_once()
+            else:
+                print("Auto contract monitor skipped: market closed")
         except Exception as error:
             print("Auto monitor warning:", error)
-        bot.time.sleep(interval)
+        delay = _seconds_until_next_hour() if hourly else interval
+        time.sleep(max(1.0, delay))
 
 
 def _scan_mode_context(now=None):
@@ -2387,26 +3946,90 @@ def _side_diagnostic(
     }
 
 
+def _marketdata_blocked_symbol_result(symbol, reason):
+    side_reason = "not evaluated: MarketData account credit limit is latched"
+    return {
+        "symbol": symbol,
+        "accepted": False,
+        "status": "DATA PROVIDER BLOCKED",
+        "direction": None,
+        "contract": None,
+        "error": str(reason),
+        "call": {"accepted": False, "reason": side_reason},
+        "put": {"accepted": False, "reason": side_reason},
+        "ignored": side_reason,
+    }
+
+
 def scan_symbol_options(symbol):
-    """Evaluate CALL and PUT independently and report every qualification check."""
+    """MACD selects the only tradable side; contract quality still gates sends."""
     symbol = str(symbol or "").upper().strip()
+    if symbol in bot.EXCLUDED_SYMBOLS:
+        return {
+            "symbol": symbol,
+            "accepted": True,
+            "status": "EXCLUDED",
+            "ignored": "symbol excluded from contract selection",
+        }
+    blocked_reason = (
+        _marketdata_account_credit_limit_reason()
+        if _provider_is_marketdata()
+        else None
+    )
+    if blocked_reason:
+        return _marketdata_blocked_symbol_result(symbol, blocked_reason)
     scan_context = _scan_mode_context()
+    try:
+        macd_signal = _fetch_macd_5m_direction(symbol)
+    except macd_direction.MacdDataError as error:
+        result = {
+            "symbol": symbol, "accepted": False, "status": "WAIT - MACD DATA",
+            "ignored": str(error), "entry_signal_mode": "MACD_5M",
+            "call": {"accepted": False, "reason": str(error)},
+            "put": {"accepted": False, "reason": str(error)},
+        }
+        _LAST_SCAN_DECISIONS[symbol] = dict(result)
+        return result
+    if macd_signal["direction"] is None:
+        result = {
+            "symbol": symbol, "accepted": False, "status": "WAIT - MACD ZERO",
+            "ignored": "MACD histogram is exactly zero", "macd": macd_signal,
+            "call": {"accepted": False, "reason": "MACD zero"},
+            "put": {"accepted": False, "reason": "MACD zero"},
+        }
+        _LAST_SCAN_DECISIONS[symbol] = dict(result)
+        return result
 
     with bot.TRADE_STATE_LOCK:
         store = bot._load_trade_store()
-        existing = (store.get("trades") or {}).get(symbol)
-        if _expire_trade_if_needed(store, symbol, existing):
+        expired_any = False
+        for trade_key, _, existing in list(_iter_trade_entries(store, symbol)):
+            expired_any = (
+                _expire_trade_if_needed(store, trade_key, existing)
+                or expired_any
+            )
+        if expired_any:
             bot._save_trade_store(store)
-            existing = None
+        recorded_contract_tickers = _existing_contract_tickers(store, symbol)
         pending_candidate = (store.get("pending_candidates") or {}).get(symbol)
-        has_active_trade = isinstance(existing, dict) and existing.get("status") in (
-            "opening",
-            "active",
-            "recovery_required",
-        )
+    if (
+        isinstance(pending_candidate, dict)
+        and bot.canonical_option_ticker(
+            pending_candidate.get("contract_ticker")
+        ) in recorded_contract_tickers
+    ):
+        _clear_pending_candidate(symbol)
+        pending_candidate = None
 
-    call_raw = massive_chain(symbol, "CALL")
-    put_raw = massive_chain(symbol, "PUT")
+    selected_side = macd_signal["direction"]
+    selected_raw = massive_chain(symbol, selected_side)
+    try:
+        opposite_raw = massive_chain(symbol, "PUT" if selected_side == "CALL" else "CALL")
+    except Exception:
+        opposite_raw = []
+        print(f"{symbol} Gamma diagnostic chain unavailable; MACD direction unchanged")
+    call_raw = selected_raw if selected_side == "CALL" else opposite_raw
+    put_raw = selected_raw if selected_side == "PUT" else opposite_raw
     stock_price, stock_source = fetch_underlying_price(symbol, call_raw, put_raw)
     if stock_price <= 0:
         return {
@@ -2420,83 +4043,16 @@ def scan_symbol_options(symbol):
             "ignored": "underlying price unavailable",
         }
 
-    gamma_info = bot.calculate_gamma_flip(call_raw, put_raw, stock_price)
-
-    if has_active_trade:
-        gamma_sync = None
-        with bot.TRADE_STATE_LOCK:
-            store = bot._load_trade_store()
-            live = (store.get("trades") or {}).get(symbol)
-            if isinstance(live, dict) and live.get("status") == "active":
-                live.update(_gamma_state_fields(gamma_info, stock_price))
-                live["stock_price"] = round(stock_price, 2)
-                live["monitor_version"] = int(live.get("monitor_version", 0)) + 1
-                (store.get("trades") or {})[symbol] = live
-                bot._save_trade_store(store)
-
-                if live.get("message_id"):
-                    gamma_sync = (
-                        live["message_id"],
-                        dict(live),
-                        (
-                            live.get("contract_ticker"),
-                            live.get("message_id"),
-                            int(live.get("monitor_version", 0)),
-                        ),
-                    )
-
-                flip = bot.safe_float(live.get("gamma_flip"))
-                side = (
-                    "ABOVE"
-                    if flip > 0 and stock_price > flip
-                    else "BELOW"
-                    if flip > 0 and stock_price < flip
-                    else "NO-FLIP"
-                )
-                warning = (
-                    live.get("direction") == "CALL" and side == "BELOW"
-                ) or (
-                    live.get("direction") == "PUT" and side == "ABOVE"
-                )
-                locked_reason = "not evaluated: active contract already locked"
-                result = {
-                    "symbol": symbol,
-                    "accepted": True,
-                    "ignored": "active contract already locked",
-                    "scan_mode": scan_context["scan_mode"],
-                    "required_score": scan_context["required_score"],
-                    "required_edge": scan_context["required_edge"],
-                    "call": {"accepted": False, "reason": locked_reason},
-                    "put": {"accepted": False, "reason": locked_reason},
-                    "gamma_flip": live.get("gamma_flip"),
-                    "stock_price": round(stock_price, 2),
-                    "price_vs_gamma_flip": side,
-                    "exit_warning": warning,
-                }
-        if gamma_sync:
-            message_id, sync_state, sync_identity = gamma_sync
-            synced, error = telegram_edit_card_retry(message_id, sync_state)
-            _record_telegram_sync(symbol, sync_identity, synced, error)
-            if not synced:
-                print("Gamma card refresh warning:", symbol, error)
-            result["telegram_synchronized"] = synced
-        if "result" in locals():
-            return result
-
-        locked_reason = "not evaluated: contract opening/locked"
-        return {
-            "symbol": symbol,
-            "accepted": True,
-            "ignored": "contract opening/locked",
-            "scan_mode": scan_context["scan_mode"],
-            "required_score": scan_context["required_score"],
-            "required_edge": scan_context["required_edge"],
-            "call": {"accepted": False, "reason": locked_reason},
-            "put": {"accepted": False, "reason": locked_reason},
-        }
+    try:
+        gamma_info = bot.calculate_gamma_flip(call_raw, put_raw, stock_price)
+    except Exception:
+        # Diagnostic information must never veto a MACD-selected contract.
+        gamma_info = {"status": "INSUFFICIENT DATA", "regime": "UNAVAILABLE"}
 
     calls, call_exp = bot._prepare_side(call_raw, stock_price)
     puts, put_exp = bot._prepare_side(put_raw, stock_price)
+    calls = _exclude_recorded_contracts(calls, recorded_contract_tickers)
+    puts = _exclude_recorded_contracts(puts, recorded_contract_tickers)
     if isinstance(pending_candidate, dict):
         if pending_candidate.get("direction") == "CALL":
             _promote_pending_candidate(calls, pending_candidate)
@@ -2515,55 +4071,46 @@ def scan_symbol_options(symbol):
         scan_context,
     )
     assessments = {}
-    if ORCA_CONSERVATIVE_MODE:
-        assessment_requirements = {}
-        if scan_context["scan_mode"] == "OPENING_FAST":
-            assessment_requirements = {
-                "minimum_score": scan_context["required_score"],
-                "minimum_edge": scan_context["required_edge"],
-                "allow_strong_score_exception": scan_context[
-                    "allow_strong_score_exception"
-                ],
-            }
-        assessments["CALL"] = _conservative_assessment(
-            "CALL", call_stats.get("best"), call_strength - put_strength,
-            gamma_info, stock_price,
-            **assessment_requirements,
+    for direction, diagnostic, stats in (
+        ("CALL", call_diag, call_stats), ("PUT", put_diag, put_stats),
+    ):
+        assessment = _macd_contract_assessment(
+            direction, stats.get("best"), gamma_info, stock_price,
+            scan_context["required_score"],
         )
-        assessments["PUT"] = _conservative_assessment(
-            "PUT", put_stats.get("best"), put_strength - call_strength,
-            gamma_info, stock_price,
-            **assessment_requirements,
+        reasons = list(assessment["wait_reasons"])
+        if direction != macd_signal["direction"]:
+            reasons.insert(0, "WAIT - OPPOSITE MACD DIRECTION")
+        assessment.update(
+            wait_reasons=reasons, wait_status=reasons[0] if reasons else "TRADE",
+            can_open=not reasons,
         )
-        ambiguous = bool(
-            call_stats.get("best") and put_stats.get("best")
-            and abs(call_strength - put_strength) < ORCA_MIN_DIRECTION_EDGE
+        assessments[direction] = assessment
+        diagnostic.update(
+            accepted=assessment["can_open"],
+            trade_confidence=assessment["trade_confidence"],
+            wait_status=assessment["wait_status"], wait_reasons=reasons,
+            entry_price_quality=assessment.get("entry_source"),
+            gamma_direction_state=assessment["gamma_direction_state"],
+            gamma_policy="diagnostic_only",
+            edge_policy="diagnostic_only", strong_score_exception=False,
+            checks={
+                "macd_direction": direction == macd_signal["direction"],
+                "contract_quality": not assessment["wait_reasons"]
+                or assessment["wait_reasons"] == ["WAIT - OPPOSITE MACD DIRECTION"],
+            },
+            reason="qualified" if not reasons else "; ".join(reasons),
         )
-        for direction, diagnostic in (("CALL", call_diag), ("PUT", put_diag)):
-            assessment = assessments[direction]
-            reasons = list(assessment["wait_reasons"])
-            if ambiguous:
-                reasons.insert(0, "WAIT - DIRECTION UNCLEAR")
-            reasons = list(dict.fromkeys(reasons))
-            assessment["wait_reasons"] = reasons
-            assessment["wait_status"] = reasons[0] if reasons else "TRADE"
-            assessment["can_open"] = not reasons
-            diagnostic.update(
-                accepted=assessment["can_open"],
-                trade_confidence=assessment["trade_confidence"],
-                wait_status=assessment["wait_status"],
-                wait_reasons=reasons,
-                entry_price_quality=assessment["entry_source"],
-                gamma_direction_state=assessment["gamma_direction_state"],
-                reason="qualified" if not reasons else "; ".join(reasons),
-            )
 
     result = {
         "symbol": symbol,
         "accepted": True,
+        "entry_signal_mode": "MACD_5M",
+        "macd": macd_signal,
+        "gamma_policy": "diagnostic_only",
         "scan_mode": scan_context["scan_mode"],
         "required_score": scan_context["required_score"],
-        "required_edge": scan_context["required_edge"],
+        "required_edge": None,
         "stock_price": round(stock_price, 2),
         "stock_price_source": stock_source,
         "call": call_diag,
@@ -2614,17 +4161,13 @@ def scan_symbol_options(symbol):
         qualified.append(("PUT", put_stats["best"], put_strength))
 
     if not qualified:
-        preferred = max(
-            (
-                ("CALL", call_stats.get("best"), call_strength),
-                ("PUT", put_stats.get("best"), put_strength),
-            ),
-            key=lambda item: item[2],
-        )
-        preferred_direction, preferred_contract, _ = preferred
+        preferred_direction = macd_signal["direction"]
+        preferred_contract = (
+            call_stats if preferred_direction == "CALL" else put_stats
+        ).get("best")
         assessment = assessments.get(preferred_direction)
         if (
-            ORCA_CONSERVATIVE_MODE and preferred_contract and assessment
+            preferred_contract and assessment
             and "WAITING FOR PRICE CONFIRMATION" in assessment["wait_reasons"]
             and not any(
                 reason not in (
@@ -2645,12 +4188,13 @@ def scan_symbol_options(symbol):
                 assessment.get("wait_status")
                 if assessment else "WAIT - NO QUALIFIED DIRECTION"
             )
-        result["ignored"] = "neither CALL nor PUT qualified"
+        result["ignored"] = "MACD-selected side has no qualified contract"
         _LAST_SCAN_DECISIONS[symbol] = {
             "status": result["status"],
             "preferred_contract": result.get("preferred_contract"),
             "call": _scan_decision_summary(call_diag),
             "put": _scan_decision_summary(put_diag),
+            "macd": dict(macd_signal),
             "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
         }
         return result
@@ -2662,13 +4206,18 @@ def scan_symbol_options(symbol):
         symbol, direction, stock_price, contract=contract, gamma_info=gamma_info,
         trade_confidence=(assessment or {}).get("trade_confidence"),
         gamma_direction=(assessment or {}).get("gamma_direction_state"),
-        directional_edge=(
-            call_diag["edge"] if direction == "CALL" else put_diag["edge"]
-        ),
+        directional_edge=None,
         scan_mode=scan_context["scan_mode"],
         required_score=scan_context["required_score"],
-        required_edge=scan_context["required_edge"],
+        required_edge=None,
+        allow_strong_score_exception=False,
+        macd_signal=macd_signal,
     )
+    if state.get("_ignored_duplicate"):
+        result["status"] = "DUPLICATE CONTRACT"
+        result["ignored"] = "exact option contract already recorded"
+        result["contract"] = state.get("contract_ticker")
+        return result
     result["direction"] = direction
     result["contract"] = state.get("contract_ticker")
     result["message_id"] = state.get("message_id")
@@ -2678,6 +4227,7 @@ def scan_symbol_options(symbol):
         "status": "TRADE",
         "contract": state.get("contract_ticker"),
         "confidence": state.get("trade_confidence"),
+        "macd": dict(macd_signal),
         "direction": direction,
         "scan_mode": scan_context["scan_mode"],
         "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
@@ -2715,21 +4265,75 @@ def _scan_log_summary(item):
     return result
 
 
-def scan_watchlist_once(force=False):
+def scan_watchlist_once(force=False, opening_window_only=False):
     """Run at most one scanner pass process-wide."""
     if not SCAN_IN_PROGRESS_LOCK.acquire(blocking=False):
         return {"accepted": True, "ignored": "scan already in progress"}
 
     try:
-        if not bot.AUTO_SCAN_ENABLED:
+        # A forced /scan-now is an explicit manual multi-symbol test. It may
+        # run while the background scanner remains disabled, but all normal
+        # freshness, score, gamma, and budget gates still apply.
+        if not bot.AUTO_SCAN_ENABLED and not force:
             return {"accepted": True, "ignored": "auto scanner disabled"}
         if not force and not bot.market_is_open_now():
             return {"accepted": True, "ignored": "US regular market is closed"}
+        if opening_window_only and not _is_within_auto_scan_window():
+            return {
+                "accepted": True,
+                "ignored": "outside opening scan window",
+                "results": [],
+            }
+
+        blocked_reason = (
+            _marketdata_account_credit_limit_reason()
+            if _provider_is_marketdata()
+            else None
+        )
+        if blocked_reason:
+            skipped_symbols = list(bot.WATCHLIST)
+            print(
+                "ORCA scan blocked by MarketData account credit limit; "
+                f"symbols_not_scanned={len(skipped_symbols)}"
+            )
+            return {
+                "accepted": True,
+                "checked": 0,
+                "results": [],
+                "skipped_symbols": skipped_symbols,
+                "incomplete": True,
+                "provider_blocked": True,
+                "error": blocked_reason,
+            }
 
         results = []
-        for symbol in bot.WATCHLIST:
+        symbols = list(bot.WATCHLIST)
+        skipped_symbols = []
+        for index, symbol in enumerate(symbols):
+            if opening_window_only and not _is_within_auto_scan_window():
+                print("ORCA opening scan window ended; remaining symbols skipped")
+                skipped_symbols.extend(symbols[index:])
+                break
             try:
                 item = scan_symbol_options(symbol)
+            except MarketDataAccountCreditLimitError as error:
+                item = _marketdata_blocked_symbol_result(symbol, error)
+                results.append(item)
+                print("🐋 ORCA SCAN:", _scan_log_summary(item))
+                skipped_symbols.extend(symbols[index + 1:])
+                print(
+                    "ORCA scan halted after MarketData account credit limit; "
+                    f"symbols_not_scanned={len(skipped_symbols)}"
+                )
+                return {
+                    "accepted": True,
+                    "checked": len(results),
+                    "results": results,
+                    "skipped_symbols": skipped_symbols,
+                    "incomplete": True,
+                    "provider_blocked": True,
+                    "error": str(error),
+                }
             except Exception as error:
                 item = {
                     "symbol": symbol,
@@ -2742,9 +4346,360 @@ def scan_watchlist_once(force=False):
             print("🐋 ORCA SCAN:", _scan_log_summary(item))
             bot.time.sleep(0.35)
 
-        return {"accepted": True, "checked": len(bot.WATCHLIST), "results": results}
+        return {
+            "accepted": True,
+            "checked": len(results),
+            "results": results,
+            "skipped_symbols": skipped_symbols,
+            "incomplete": bool(skipped_symbols),
+            "provider_blocked": False,
+        }
     finally:
         SCAN_IN_PROGRESS_LOCK.release()
+
+
+def _ichimoku_status_update(**changes):
+    """Publish safe telemetry for the bot-native Ichimoku signal worker."""
+    with _ICHIMOKU_STATUS_LOCK:
+        _ICHIMOKU_STATUS.update(changes)
+        return dict(_ICHIMOKU_STATUS)
+
+
+def bot_ichimoku_signal_loop():
+    """Poll age-gated Massive bars and scan a symbol when a crossing appears."""
+    symbols = [
+        symbol for symbol in bot.WATCHLIST
+        if symbol not in bot.EXCLUDED_SYMBOLS
+    ]
+    if not symbols:
+        _ichimoku_status_update(last_poll_status="no eligible symbols")
+        return
+
+    slot_seconds = max(
+        5.0, ICHIMOKU_30M_POLL_SECONDS / max(1, len(symbols))
+    )
+    print(
+        "ORCA bot-native Ichimoku worker: "
+        f"polling {len(symbols)} symbols on a {ICHIMOKU_30M_POLL_SECONDS:g}s "
+        f"cycle; rejecting 30-minute bars older than "
+        f"{ICHIMOKU_30M_BAR_MAX_AGE_SECONDS}s"
+    )
+    time.sleep(8)
+
+    while True:
+        now = bot.now_new_york()
+        if not bot.AUTO_SCAN_ENABLED:
+            _ichimoku_status_update(
+                last_poll_finished=now.isoformat(timespec="seconds"),
+                last_poll_status="auto scanner disabled",
+                last_poll_checked=0,
+                last_poll_signals=0,
+                last_poll_errors=0,
+                last_poll_error=None,
+            )
+            time.sleep(60)
+            continue
+        if not bot.market_is_open_now(now) or not _is_within_auto_scan_window(now):
+            _ichimoku_status_update(
+                last_poll_finished=now.isoformat(timespec="seconds"),
+                last_poll_status="market closed or outside scan window",
+                last_poll_checked=0,
+                last_poll_signals=0,
+                last_poll_errors=0,
+                last_poll_error=None,
+            )
+            time.sleep(60)
+            continue
+
+        _ichimoku_status_update(
+            last_poll_started=now.isoformat(timespec="seconds"),
+            last_poll_status="running",
+            last_poll_error=None,
+        )
+        checked = signals = errors = 0
+        first_error = None
+        next_slot = time.monotonic()
+
+        for symbol in symbols:
+            now = bot.now_new_york()
+            if (
+                not bot.market_is_open_now(now)
+                or not _is_within_auto_scan_window(now)
+            ):
+                break
+            checked += 1
+
+            try:
+                with bot.TRADE_STATE_LOCK:
+                    store = bot._load_trade_store()
+                    existing_trade = (store.get("trades") or {}).get(symbol)
+                    has_active_trade = (
+                        isinstance(existing_trade, dict)
+                        and existing_trade.get("status") in (
+                            "opening", "active", "recovery_required"
+                        )
+                    )
+
+                if not has_active_trade:
+                    signal = _active_ichimoku_30m_signal(symbol, now=now)
+                    if signal is None:
+                        signal, ignored = _poll_and_register_bot_ichimoku_signal(
+                            symbol, now=now
+                        )
+                        if ignored and ignored != "no crossing on the latest completed bar":
+                            print(f"{symbol} bot Ichimoku check: {ignored}")
+
+                    if signal:
+                        signals += 1
+                        if SCAN_IN_PROGRESS_LOCK.acquire(blocking=False):
+                            try:
+                                result = scan_symbol_options(symbol)
+                                if result.get("error"):
+                                    raise RuntimeError(result["error"])
+                            finally:
+                                SCAN_IN_PROGRESS_LOCK.release()
+                        else:
+                            print(
+                                f"{symbol} bot Ichimoku signal retained; "
+                                "another scanner pass is in progress"
+                            )
+            except Exception as error:
+                errors += 1
+                if first_error is None:
+                    first_error = str(error)[:300]
+                print(f"{symbol} bot Ichimoku poll warning: {error}")
+
+            next_slot += slot_seconds
+            wait_seconds = next_slot - time.monotonic()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+
+        finished = bot.now_new_york().isoformat(timespec="seconds")
+        _ichimoku_status_update(
+            last_poll_finished=finished,
+            last_poll_status=(
+                "completed" if errors == 0 else "completed with errors"
+            ),
+            last_poll_checked=checked,
+            last_poll_signals=signals,
+            last_poll_errors=errors,
+            last_poll_error=first_error,
+        )
+
+
+def _scanner_status_update(**changes):
+    """Persist safe scanner telemetry for health checks without exposing secrets."""
+    with _SCANNER_STATUS_LOCK:
+        _SCANNER_STATUS.update(changes)
+        return dict(_SCANNER_STATUS)
+
+
+def _scanner_result_counts(result):
+    """Summarize one completed pass for operators and health checks."""
+    result = result or {}
+    items = result.get("results") or []
+    trades = 0
+    errors = 0
+    ignored = 0
+    for item in items:
+        if not isinstance(item, dict):
+            errors += 1
+            continue
+        if item.get("status") == "TRADE" and item.get("message_id"):
+            trades += 1
+        if item.get("error"):
+            errors += 1
+        if item.get("ignored") or item.get("status") not in (None, "TRADE"):
+            ignored += 1
+    if result.get("provider_blocked") and errors == 0:
+        errors = 1
+    return {
+        "checked": len(items),
+        "trades": trades,
+        "errors": errors,
+        "ignored": ignored,
+        "skipped": len(result.get("skipped_symbols") or []),
+    }
+
+
+def _is_within_auto_scan_window(now=None):
+    """Return whether now is within the configured opening-session scan window."""
+    if AUTO_SCAN_OPENING_WINDOW_MINUTES <= 0:
+        return False
+    now = now or bot.now_new_york()
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    market_open_minute = 9 * 60 + 30
+    return (
+        market_open_minute
+        <= minutes
+        < market_open_minute + AUTO_SCAN_OPENING_WINDOW_MINUTES
+    )
+
+
+def _seconds_until_next_auto_scan(
+    now=None,
+    regular_interval_seconds=None,
+    opening_interval_seconds=None,
+):
+    """Align scans to market open: every 3m for 15m, then the regular cadence."""
+    now = now or bot.now_new_york()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=bot.NEW_YORK_TZ)
+    else:
+        now = now.astimezone(bot.NEW_YORK_TZ)
+
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    elapsed_seconds = (now - market_open).total_seconds()
+    if elapsed_seconds < 0:
+        return max(1.0, -elapsed_seconds)
+
+    fast_window_seconds = 15 * 60
+    if elapsed_seconds < fast_window_seconds:
+        opening_interval_seconds = (
+            opening_interval_seconds
+            if opening_interval_seconds is not None
+            else AUTO_SCAN_OPENING_INTERVAL_SECONDS
+        )
+        cadence_seconds = max(60.0, float(opening_interval_seconds))
+    else:
+        regular_interval_seconds = (
+            regular_interval_seconds
+            if regular_interval_seconds is not None
+            else getattr(bot, "AUTO_SCAN_SECONDS", 900)
+        )
+        cadence_seconds = max(60.0, float(regular_interval_seconds))
+
+    next_slot = (int(elapsed_seconds // cadence_seconds) + 1) * cadence_seconds
+    return max(1.0, next_slot - elapsed_seconds)
+
+
+def _seconds_until_next_market_open(now=None):
+    """Wait until the next valid 09:30 New York opening, skipping holidays."""
+    now = now or bot.now_new_york()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=bot.NEW_YORK_TZ)
+    else:
+        now = now.astimezone(bot.NEW_YORK_TZ)
+
+    for day_offset in range(15):
+        trading_day = now.date() + timedelta(days=day_offset)
+        opening = now.replace(
+            year=trading_day.year,
+            month=trading_day.month,
+            day=trading_day.day,
+            hour=9,
+            minute=30,
+            second=0,
+            microsecond=0,
+        )
+        if opening > now and bot.market_is_open_now(opening):
+            return max(1.0, (opening - now).total_seconds())
+    return 60.0
+
+
+def auto_scan_loop():
+    """Run the canonical scanner forever, even when a pass raises unexpectedly."""
+    interval = max(float(getattr(bot, "AUTO_SCAN_SECONDS", 3600)), 60.0)
+    opening_interval = AUTO_SCAN_OPENING_INTERVAL_SECONDS
+    print(
+        f"ORCA canonical scanner: every {opening_interval:g}s for the first "
+        f"15 minutes after 09:30 New York, then every {interval:g}s; "
+        "scanning only during the "
+        f"first {AUTO_SCAN_OPENING_WINDOW_MINUTES} minutes of the session"
+    )
+    time.sleep(8)
+    while True:
+        now = bot.now_new_york()
+        started = now.isoformat(timespec="seconds")
+        _scanner_status_update(
+            last_cycle_started=started,
+            last_cycle_status="running",
+            last_cycle_error=None,
+        )
+        delay = interval
+        try:
+            if not bot.market_is_open_now(now):
+                _scanner_status_update(
+                    last_cycle_finished=bot.now_new_york().isoformat(timespec="seconds"),
+                    last_cycle_status="market closed",
+                    last_cycle_checked=0,
+                    last_cycle_trades=0,
+                    last_cycle_errors=0,
+                    last_cycle_ignored=0,
+                    last_cycle_skipped=0,
+                    last_cycle_error=None,
+                )
+                delay = _seconds_until_next_market_open(now)
+            elif not _is_within_auto_scan_window(now):
+                _scanner_status_update(
+                    last_cycle_finished=bot.now_new_york().isoformat(timespec="seconds"),
+                    last_cycle_status="outside opening scan window",
+                    last_cycle_checked=0,
+                    last_cycle_trades=0,
+                    last_cycle_errors=0,
+                    last_cycle_ignored=0,
+                    last_cycle_skipped=0,
+                    last_cycle_error=None,
+                )
+                delay = _seconds_until_next_market_open(now)
+            else:
+                result = scan_watchlist_once(False, opening_window_only=True)
+                counts = _scanner_result_counts(result)
+                cycle_status = (
+                    "blocked by MarketData account credit limit"
+                    if result.get("provider_blocked")
+                    else "incomplete"
+                    if result.get("incomplete")
+                    else "completed with errors"
+                    if counts["errors"]
+                    else "completed"
+                )
+                _scanner_status_update(
+                    last_cycle_finished=bot.now_new_york().isoformat(timespec="seconds"),
+                    last_cycle_status=cycle_status,
+                    last_cycle_checked=counts["checked"],
+                    last_cycle_trades=counts["trades"],
+                    last_cycle_errors=counts["errors"],
+                    last_cycle_ignored=counts["ignored"],
+                    last_cycle_skipped=counts["skipped"],
+                    last_cycle_error=(
+                        str(result.get("error"))[:500]
+                        if result.get("error")
+                        else None
+                    ),
+                )
+                print(
+                    "ORCA scanner cycle:",
+                    f"checked={counts['checked']}",
+                    f"trades={counts['trades']}",
+                    f"errors={counts['errors']}",
+                    f"ignored={counts['ignored']}",
+                    f"skipped={counts['skipped']}",
+                )
+                delay = _seconds_until_next_auto_scan(
+                    bot.now_new_york(),
+                    regular_interval_seconds=interval,
+                    opening_interval_seconds=opening_interval,
+                )
+        except Exception as error:
+            _scanner_status_update(
+                last_cycle_finished=bot.now_new_york().isoformat(timespec="seconds"),
+                last_cycle_status="failed",
+                last_cycle_error=str(error)[:500],
+            )
+            print("ORCA canonical scanner warning:", error)
+            recovery_time = bot.now_new_york()
+            if bot.market_is_open_now(recovery_time) and _is_within_auto_scan_window(recovery_time):
+                delay = _seconds_until_next_auto_scan(
+                    recovery_time,
+                    regular_interval_seconds=interval,
+                    opening_interval_seconds=opening_interval,
+                )
+            else:
+                delay = _seconds_until_next_market_open(recovery_time)
+        time.sleep(max(1.0, delay))
 
 
 def parse_force(value):
@@ -2845,13 +4800,18 @@ def _start_thread_once(kind, target, name):
 
 
 def start_auto_monitor():
+    if not AUTO_MONITOR_ENABLED:
+        print("Auto contract monitor disabled by configuration")
+        return None
     return _start_thread_once("monitor", auto_monitor_loop, "reef-auto-monitor")
 
 
 def start_auto_scanner():
     if not bot.AUTO_SCAN_ENABLED:
         return None
-    return _start_thread_once("scanner", bot.auto_scan_loop, "orca-options-scanner")
+    return _start_thread_once(
+        "scanner", bot.auto_scan_loop, "orca-options-scanner"
+    )
 
 
 def _thread_status(kind):
@@ -2872,8 +4832,12 @@ class CanonicalHandler(bot.Handler):
         try:
             with bot.TRADE_STATE_LOCK:
                 store = bot._load_trade_store()
-                for symbol, trade in (store.get("trades") or {}).items():
-                    if isinstance(trade, dict) and trade.get("status") == "active":
+                for _, symbol, trade in _iter_trade_entries(store):
+                    if (
+                        isinstance(trade, dict)
+                        and trade.get("status") == "active"
+                        and symbol not in bot.EXCLUDED_SYMBOLS
+                    ):
                         monitored.append({
                             "symbol": symbol,
                             "contract_ticker": trade.get("contract_ticker"),
@@ -2914,12 +4878,14 @@ class CanonicalHandler(bot.Handler):
         self.json_response(200, {"ok": True, "service": "ORCA WHALE OPTIONS BOT",
                                   "conservative_mode": ORCA_CONSERVATIVE_MODE,
                                   "conservative_min_score": ORCA_CONSERVATIVE_MIN_SCORE,
-                                  "minimum_direction_edge": ORCA_MIN_DIRECTION_EDGE,
+                                  "minimum_direction_edge": None,
+                                  "gamma_direction_gate_enabled": False,
                                   "data_feed_mode": "delayed/non-paid compatible; not claimed real-time",
                                   "last_scan_decisions": dict(_LAST_SCAN_DECISIONS),
                                   "pending_price_confirmation": pending,
                                   "paper_performance": performance,
-                                 "monitor_interval_seconds": getattr(bot, "AUTO_MONITOR_SECONDS", 5),
+                                  "scanner_interval_seconds": getattr(bot, "AUTO_SCAN_SECONDS", 3600),
+                                  "monitor_interval_seconds": getattr(bot, "AUTO_MONITOR_SECONDS", 3600),
                                  "monitored_contracts": monitored,
                                  "trade_state_path": str(trade_state_path()),
                                  "trade_state_path_configured": bool(os.getenv("TRADE_STATE_PATH", "").strip()),
@@ -2928,9 +4894,19 @@ class CanonicalHandler(bot.Handler):
                                  "restored_active_trade_count": _RESTORED_ACTIVE_TRADE_COUNT,
                                  "recovery_required_count": _RECOVERY_REQUIRED_COUNT,
                                  "scanner_thread_running": _thread_status("scanner"),
+                                  "scanner_status": dict(_SCANNER_STATUS),
+                                   "ichimoku_worker_running": False,
+                                   "ichimoku_entry_gate_enabled": False,
                                  "monitor_thread_running": _thread_status("monitor"),
                                  "duplicate_thread_start_prevented": _DUPLICATE_THREAD_START_PREVENTED,
                                   "configuration": {
+                                       "data_provider": DATA_PROVIDER,
+                                        "marketdata_api_key_present": bool(
+                                            bot.env("MARKETDATA_API_KEY")
+                                        ),
+                                       "tradier_token_present": bool(
+                                           bot.env("TRADIER_TOKEN")
+                                       ),
                                       "telegram_bot_token_present": bool(
                                           bot.env("TELEGRAM_BOT_TOKEN")
                                       ),
@@ -2943,7 +4919,30 @@ class CanonicalHandler(bot.Handler):
                                       "webhook_secret_present": bool(
                                           bot.env("REEF_WEBHOOK_SECRET")
                                       ),
-                                      "contract_dte_window": f"0-{SCORE_MAX_DTE}",
+                                        "contract_dte_window": (
+                                            f"{SCORE_MIN_DTE}-{SCORE_MAX_DTE}"
+                                        ),
+                                        "auto_scan_opening_window_minutes": (
+                                            AUTO_SCAN_OPENING_WINDOW_MINUTES
+                                        ),
+                                        "auto_scan_opening_interval_seconds": (
+                                            AUTO_SCAN_OPENING_INTERVAL_SECONDS
+                                        ),
+                                        "entry_signal_mode": "MACD_5M",
+                                        "macd_settings": {
+                                            "fast": 120, "slow": 180, "signal": 40,
+                                            "signal_average": "SMA", "timeframe_minutes": 5,
+                                            "closed_candles_only": True,
+                                            "gamma_policy": "diagnostic_only",
+                                            "source": "TradingView /macd-signal",
+                                        },
+                                        "ichimoku_entry_gate_enabled": False,
+                                        "auto_monitor_enabled": AUTO_MONITOR_ENABLED,
+                                       "excluded_symbols": sorted(bot.EXCLUDED_SYMBOLS),
+                                  "option_budget_per_contract_usd": {
+                                      "min": round(OPTION_ENTRY_MIN_PREMIUM * 100.0, 2),
+                                      "max": round(OPTION_ENTRY_MAX_PREMIUM * 100.0, 2),
+                                  },
                                       "massive_chain_cache_ttl_seconds": (
                                           MASSIVE_CHAIN_CACHE_TTL_SECONDS
                                       ),
@@ -2952,8 +4951,65 @@ class CanonicalHandler(bot.Handler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/macd-signal":
+            secret = bot.env("REEF_WEBHOOK_SECRET")
+            if not secret:
+                self.json_response(503, {"error": "webhook authentication is not configured"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 16384:
+                    raise ValueError("MACD request must be at most 16 KiB")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON object required")
+            except (ValueError, UnicodeDecodeError):
+                self.json_response(400, {"error": "valid bounded JSON object required"})
+                return
+            if not hmac.compare_digest(
+                str(payload.get("secret", "")).encode("utf-8"), secret.encode("utf-8")
+            ):
+                self.json_response(401, {"error": "invalid secret"})
+                return
+            try:
+                signal = macd_direction.from_webhook(
+                    payload, bot.now_new_york(), bot.WATCHLIST, bot.EXCLUDED_SYMBOLS,
+                )
+            except macd_direction.MacdDataError as error:
+                self.json_response(400, {"error": str(error)})
+                return
+            with _MACD_CACHE_LOCK:
+                previous = _MACD_CACHE.get(signal["symbol"])
+                if (
+                    previous and previous.get("source") == "tradingview_closed_bar"
+                    and previous.get("bar_time_ms") == signal["bar_time_ms"]
+                    and previous.get("histogram") != signal["histogram"]
+                ):
+                    self.json_response(409, {"error": "conflicting values for an already closed candle"})
+                    return
+                _MACD_CACHE[signal["symbol"]] = dict(signal)
+            # Cache a heartbeat, not a second scanner. Preserve the approved cadence.
+            self.json_response(200, {
+                "accepted": True, "cached": True, "signal": signal,
+                "note": "direction will be used by the scheduled ORCA scan; no alert sent by this request",
+            })
+            return
+        if not AUTO_MONITOR_ENABLED and path in ("/monitor-tick", "/option-price"):
+            self.json_response(
+                503, {"error": "automatic contract updates are disabled"}
+            )
+            return
+        if path == "/signal":
+            self.json_response(410, {
+                "accepted": False,
+                "error": (
+                    "Entry webhooks are disabled; ORCA qualifies contracts "
+                    "using its MACD direction and contract-quality scan."
+                ),
+            })
+            return
         if path != "/scan-now":
-            if path in ("/signal", "/monitor-tick", "/option-price"):
+            if path in ("/monitor-tick", "/option-price"):
                 secret = bot.env("REEF_WEBHOOK_SECRET")
                 if not secret:
                     self.json_response(
@@ -2996,6 +5052,15 @@ class CanonicalHandler(bot.Handler):
                             "ticker": payload.get("ticker"),
                         })
                         return
+                    self.json_response(410, {
+                        "error": (
+                            "entry webhooks are disabled; ORCA selects contracts "
+                            "using MACD direction and contract-quality filters"
+                        ),
+                        "signal_type": signal_type or None,
+                        "ticker": payload.get("ticker"),
+                    })
+                    return
                 # The historical handler owns the route implementation. Restore
                 # the authenticated body so it can parse it normally.
                 normalized_bytes = json.dumps(
@@ -3051,9 +5116,11 @@ bot.net_gamma_exposure_at_price = net_gamma_exposure_at_price
 bot.create_trade = create_trade
 bot.scan_symbol_options = scan_symbol_options
 bot.scan_watchlist_once = scan_watchlist_once
+bot.massive_contract_snapshot = provider_contract_snapshot
 bot.monitor_active_trades_once = monitor_active_trades_once
 bot.monitor_active_trade_once = monitor_active_trades_once
 bot.auto_monitor_loop = auto_monitor_loop
+bot.auto_scan_loop = auto_scan_loop
 bot.telegram_edit_card_retry = telegram_edit_card_retry
 bot.telegram_send_card = telegram_send_card
 bot._load_trade_store = _load_durable_trade_store
