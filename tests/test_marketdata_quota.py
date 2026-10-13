@@ -196,6 +196,25 @@ class QuotaRequestTests(unittest.TestCase):
             self.assertNotIn("mode", get.call_args.kwargs["params"])
         self.assertEqual(self.quota.snapshot()["credits_consumed_since_start"], 1)
 
+    def test_last_credits_used_by_success_stop_remaining_symbols_without_errors(self):
+        def scan_symbol(symbol):
+            self.quota.observe({"x-api-ratelimit-remaining": "0"})
+            return {"symbol": symbol, "accepted": True, "ignored": "no eligible contract"}
+
+        with (
+            patch.object(app, "DATA_PROVIDER", "marketdata"),
+            patch.object(app.bot, "env", return_value="test"),
+            patch.object(app.bot, "WATCHLIST", ["AAPL", "AMD", "MSFT"]),
+            patch.object(app, "scan_symbol_options", side_effect=scan_symbol) as scan,
+            patch.object(app.bot.time, "sleep"),
+        ):
+            result = app.scan_watchlist_once(force=True)
+        scan.assert_called_once_with("AAPL")
+        self.assertEqual(result["checked"], 1)
+        self.assertEqual(result["skipped_symbols"], ["AMD", "MSFT"])
+        self.assertTrue(result["provider_blocked"])
+        self.assertEqual(app._scanner_result_counts(result)["errors"], 1)
+
     def test_concurrent_chain_misses_purchase_once_and_preserve_full_universe(self):
         records = [{"details": {"contract_type": "call", "strike_price": 100}},
                    {"details": {"contract_type": "put", "strike_price": 200}}]

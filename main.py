@@ -3911,6 +3911,22 @@ def scan_watchlist_once(force=False, opening_window_only=False):
         symbols = list(bot.WATCHLIST)
         skipped_symbols = []
         for index, symbol in enumerate(symbols):
+            # A successful response can itself spend the last credits. Stop
+            # here rather than logging an error for every remaining company.
+            exhausted = (
+                _marketdata_account_credit_limit_reason()
+                if _provider_is_marketdata() else None
+            )
+            if exhausted:
+                return {
+                    "accepted": True,
+                    "checked": len(results),
+                    "results": results,
+                    "skipped_symbols": symbols[index:],
+                    "incomplete": True,
+                    "provider_blocked": True,
+                    "error": exhausted,
+                }
             if opening_window_only and not _is_within_auto_scan_window():
                 print("ORCA opening scan window ended; remaining symbols skipped")
                 skipped_symbols.extend(symbols[index:])
