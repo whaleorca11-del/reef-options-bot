@@ -14,17 +14,17 @@ from zoneinfo import ZoneInfo
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
+from provider_config import PROVIDER_KEYS, REMOVED_PROVIDERS, resolve_data_provider
 
 # ============================================================
 # REEF ONE FILE BOT
 # ORCA score/Gamma contract selection -> options provider -> Telegram
-# + Massive option-contract tracking -> targets / stop loss
+# + Configured-provider option-contract tracking -> targets / stop loss
 # + CONTRACT LOCK: one active contract per stock; duplicate stock signals are ignored
 # ============================================================
 
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8000"))
-BASE_URL = "https://api.massive.com"
 STATE_FILE = Path(__file__).with_name("reef_trade_state.json")
 
 # HARD LOCK: prevents two simultaneous TradingView requests from opening
@@ -555,23 +555,8 @@ def telegram_edit(message_id, text):
 
 
 def massive_chain(symbol, direction):
-    api_key = env("MASSIVE_API_KEY")
-    if not api_key:
-        raise RuntimeError("MASSIVE_API_KEY is missing")
-
-    contract_type = "call" if direction == "CALL" else "put"
-
-    r = requests.get(
-        f"{BASE_URL}/v3/snapshot/options/{symbol}",
-        params={
-            "contract_type": contract_type,
-            "limit": 250,
-            "apiKey": api_key,
-        },
-        timeout=20,
-    )
-    r.raise_for_status()
-    return r.json().get("results", [])
+    """Legacy name; main.py installs the permitted-provider dispatcher."""
+    raise RuntimeError("Massive has been removed; run main.py to use MarketData")
 
 
 def normalize_contract(raw, stock_price):
@@ -855,22 +840,8 @@ def message_from_state(s):
 
 
 def massive_contract_snapshot(symbol, contract_ticker):
-    """Fetch one selected option contract snapshot from Massive."""
-    api_key = env("MASSIVE_API_KEY")
-    if not api_key:
-        raise RuntimeError("MASSIVE_API_KEY is missing")
-
-    canonical = canonical_option_ticker(contract_ticker)
-    option_symbol = "O:" + canonical
-
-    r = requests.get(
-        f"{BASE_URL}/v3/snapshot/options/{symbol}/{option_symbol}",
-        params={"apiKey": api_key},
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json()
-    return data.get("results") or data
+    """Legacy name; main.py installs the permitted-provider dispatcher."""
+    raise RuntimeError("Massive has been removed; run main.py to use MarketData")
 
 
 def extract_snapshot_price(snapshot):
@@ -1866,24 +1837,26 @@ def start_auto_scanner():
 
 
 def main():
-    data_provider = env("DATA_PROVIDER").lower()
-    if data_provider in ("tradier", "tradier_live"):
-        provider_key = "TRADIER_TOKEN"
-    elif data_provider in ("thetadata", "theta", "thetadata_live"):
-        provider_key = "THETADATA_API_KEY"
-    elif data_provider in ("marketdata", "marketdata_app", "marketdata_live"):
-        provider_key = "MARKETDATA_API_KEY"
-    else:
-        provider_key = "MASSIVE_API_KEY"
+    requested_provider = env("DATA_PROVIDER").lower()
+    data_provider = resolve_data_provider(requested_provider)
+    provider_key = PROVIDER_KEYS[data_provider]
+    if requested_provider in REMOVED_PROVIDERS:
+        print("Massive/Polygon permanently removed; legacy configuration now uses MarketData")
     missing = [
         name for name in
-        (provider_key, "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+        ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
         if not env(name)
     ]
 
     if missing:
         print("❌ Missing environment variables:", ", ".join(missing))
         return
+    provider_ready = bool(env(provider_key))
+    if not provider_ready:
+        print(
+            f"DATA PROVIDER BLOCKED: {provider_key} is missing. "
+            "HTTP diagnostics remain available; market requests are blocked."
+        )
 
     print("=" * 60)
     print("ORCA WHALE OPTIONS BOT - AUTONOMOUS SCANNER")
@@ -1902,8 +1875,9 @@ def main():
     )
     print()
     print(
-        "✅ ORCA جاهز: ماسح عقود مستقل + "
-        f"{data_provider or 'massive'} "
+        ("✅ ORCA جاهز: ماسح عقود مستقل + " if provider_ready
+         else "ORCA HTTP جاهز؛ فحص السوق متوقف لحين تهيئة ")
+        + f"{data_provider} "
         + ("لاختيار ومتابعة العقد" if monitoring_enabled else "لاختيار العقود فقط")
     )
     print("لإيقافه: Ctrl + C")

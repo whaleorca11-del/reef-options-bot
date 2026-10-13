@@ -19,16 +19,17 @@ from urllib.parse import urlparse
 
 import requests
 import macd_direction
+from provider_config import PROVIDER_KEYS, REMOVED_PROVIDERS, resolve_data_provider
 
 import orca_whale_options_bot_FAST_60S_5S as bot
 
 # Canonical production scanner threshold for this entry point.
 bot.AUTO_SCAN_MIN_SCORE = 75.0
 bot.ENTRY_SIGNAL_DESCRIPTION = "Autonomous ORCA contract score, Gamma and directional flow -> fresh option quote -> Telegram; no MACD/EMA200 entry gate"
-_ORIGINAL_MASSIVE_CONTRACT_SNAPSHOT = bot.massive_contract_snapshot
 
 
-DATA_PROVIDER = os.getenv("DATA_PROVIDER", "massive").strip().lower()
+REQUESTED_DATA_PROVIDER = os.getenv("DATA_PROVIDER", "").strip().lower()
+DATA_PROVIDER = resolve_data_provider(REQUESTED_DATA_PROVIDER)
 AUTO_SCAN_OPENING_WINDOW_MINUTES = max(
     0, int(os.getenv("AUTO_SCAN_OPENING_WINDOW_MINUTES", "390"))
 )
@@ -1984,7 +1985,7 @@ def _provider_token():
         return bot.env("THETADATA_API_KEY")
     if _provider_is_marketdata():
         return bot.env("MARKETDATA_API_KEY")
-    return bot.env("MASSIVE_API_KEY")
+    raise RuntimeError(f"Unsupported or removed data provider: {DATA_PROVIDER}")
 
 
 def _marketdata_account_credit_limit_reason():
@@ -2670,94 +2671,18 @@ def provider_contract_snapshot(symbol, contract_ticker):
         return _tradier_contract_snapshot(symbol, contract_ticker)
     if _provider_is_marketdata():
         return _marketdata_contract_snapshot(symbol, contract_ticker)
-    return _ORIGINAL_MASSIVE_CONTRACT_SNAPSHOT(symbol, contract_ticker)
+    raise RuntimeError(f"Unsupported or removed data provider: {DATA_PROVIDER}")
 
 
 def massive_chain(symbol, direction):
-    """Fetch a chain with short caching and explicit rate-limit protection."""
+    """Historical entry-point name; dispatch only to permitted providers."""
     if _provider_is_thetadata():
         return _filter_contracts_by_dte(_thetadata_chain(symbol, direction))
     if _provider_is_tradier():
         return _filter_contracts_by_dte(_tradier_chain(symbol, direction))
     if _provider_is_marketdata():
         return _filter_contracts_by_dte(_marketdata_chain(symbol, direction))
-    global _MASSIVE_BACKOFF_UNTIL, _UNDERLYING_PRICE_BACKOFF_UNTIL
-    api_key = bot.env("MASSIVE_API_KEY")
-    if not api_key:
-        raise RuntimeError("MASSIVE_API_KEY is missing")
-
-    symbol = str(symbol or "").upper().strip()
-    direction = str(direction or "").upper().strip()
-    cache_key = (symbol, direction)
-    now_monotonic = time.monotonic()
-    with _MASSIVE_CHAIN_CACHE_LOCK:
-        cached = _MASSIVE_CHAIN_CACHE.get(cache_key)
-        if (
-            isinstance(cached, dict)
-            and now_monotonic - cached["timestamp"] <= MASSIVE_CHAIN_CACHE_TTL_SECONDS
-        ):
-            print(
-                f"{symbol} {direction} chain source: cache "
-                f"age={now_monotonic - cached['timestamp']:.1f}s"
-            )
-            return _filter_contracts_by_dte(list(cached["results"]))
-
-    if now_monotonic < _MASSIVE_BACKOFF_UNTIL:
-        remaining = max(0.0, _MASSIVE_BACKOFF_UNTIL - now_monotonic)
-        raise RuntimeError(
-            f"MASSIVE_RATE_LIMIT_BACKOFF: {symbol} {direction}, "
-            f"retry in {remaining:.0f}s"
-        )
-
-    contract_type = "call" if direction == "CALL" else "put"
-    url = f"{bot.BASE_URL}/v3/snapshot/options/{symbol}"
-    params = {
-        "contract_type": contract_type,
-        "limit": 250,
-        "apiKey": api_key,
-    }
-    results = []
-    seen_urls = set()
-
-    while url:
-        if url in seen_urls:
-            raise RuntimeError(f"Massive pagination loop detected for {symbol} {direction}")
-        seen_urls.add(url)
-
-        response = requests.get(url, params=params, timeout=20)
-        if response.status_code == 429:
-            delay = _massive_rate_limit_delay(response)
-            _MASSIVE_BACKOFF_UNTIL = max(
-                _MASSIVE_BACKOFF_UNTIL, time.monotonic() + delay
-            )
-            _UNDERLYING_PRICE_BACKOFF_UNTIL = max(
-                _UNDERLYING_PRICE_BACKOFF_UNTIL, time.monotonic() + delay
-            )
-            raise RuntimeError(
-                f"MASSIVE_RATE_LIMIT: {symbol} {direction}; "
-                f"retry in {delay:.0f}s"
-            )
-        if not response.ok:
-            raise RuntimeError(_massive_error(response, f"{symbol} {direction}"))
-        payload = response.json()
-        page = payload.get("results") or []
-        if not isinstance(page, list):
-            raise RuntimeError(f"Unexpected Massive chain response for {symbol} {direction}")
-        results.extend(page)
-
-        next_url = payload.get("next_url")
-        if not next_url:
-            break
-        url = str(next_url)
-        params = {"apiKey": api_key}
-
-    results = _filter_contracts_by_dte(results)
-    with _MASSIVE_CHAIN_CACHE_LOCK:
-        _MASSIVE_CHAIN_CACHE[cache_key] = {
-            "timestamp": time.monotonic(),
-            "results": list(results),
-        }
-    return results
+    raise RuntimeError(f"Unsupported or removed data provider: {DATA_PROVIDER}")
 
 
 def _first_valid_stock_price(payload):
@@ -2813,12 +2738,8 @@ def _first_valid_stock_price(payload):
 
 
 def _massive_stock_get(path, api_key, params=None):
-    """Fetch one stock endpoint without allowing endpoint failure to stop scans."""
-    query = dict(params or {})
-    query["apiKey"] = api_key
-    response = requests.get(f"{bot.BASE_URL}{path}", params=query, timeout=20)
-    response.raise_for_status()
-    return response.json()
+    """Historical compatibility only: the retired provider cannot make requests."""
+    raise RuntimeError("Massive has been permanently removed")
 
 
 def _fetch_macd_1h_direction(symbol, now=None):
@@ -2850,38 +2771,8 @@ def _macd_health_snapshot():
 
 
 def _fetch_bot_ichimoku_30m_signal(symbol, now=None):
-    """Fetch and calculate a fresh 30-minute crossing without a webhook."""
-    symbol = str(symbol or "").upper().strip()
-    api_key = bot.env("MASSIVE_API_KEY")
-    if not api_key:
-        return None, "MASSIVE_API_KEY is not configured"
-    if not symbol or symbol not in bot.WATCHLIST:
-        return None, "ticker is not in the ORCA watchlist"
-    if symbol in bot.EXCLUDED_SYMBOLS:
-        return None, "ticker is excluded from contract selection"
-
-    now = now or bot.now_new_york()
-    try:
-        end_date = now.date()
-        start_date = end_date - timedelta(days=30)
-        payload = _massive_stock_get(
-            f"/v2/aggs/ticker/{symbol}/range/30/minute/"
-            f"{start_date.isoformat()}/{end_date.isoformat()}",
-            api_key,
-            {"adjusted": "true", "sort": "asc", "limit": 5000},
-        )
-        if not isinstance(payload, dict):
-            return None, "Massive returned an invalid aggregate response"
-        if str(payload.get("status") or "").upper() == "DELAYED":
-            return None, "Massive explicitly marked the aggregate feed delayed"
-        bars = payload.get("results")
-        signal = _ichimoku_30m_signal_from_bars(
-            symbol, bars, now=now
-        )
-        return signal, None if signal else "no crossing on the latest completed bar"
-    except Exception as error:
-        safe_error = str(error).replace(api_key, "[redacted]")
-        return None, f"30-minute aggregate check failed: {safe_error[:300]}"
+    """Keep historical calculations, but never fetch from the retired provider."""
+    return None, "Massive has been permanently removed; automatic Ichimoku polling is disabled"
 
 
 def _poll_and_register_bot_ichimoku_signal(symbol, now=None):
@@ -2896,105 +2787,14 @@ def _poll_and_register_bot_ichimoku_signal(symbol, now=None):
 
 
 def fetch_underlying_price(symbol, call_raw, put_raw):
-    """Use a cached/latest minute aggregate, retaining option inference as fallback."""
+    """Fetch an underlying price only through the configured permitted provider."""
     if _provider_is_thetadata():
         return _thetadata_underlying_price(symbol)
     if _provider_is_tradier():
         return _tradier_underlying_price(symbol)
     if _provider_is_marketdata():
         return _marketdata_underlying_price(symbol, call_raw, put_raw)
-    global _UNDERLYING_PRICE_BACKOFF_UNTIL, _MASSIVE_BACKOFF_UNTIL
-    symbol = str(symbol or "").upper().strip()
-    api_key = bot.env("MASSIVE_API_KEY")
-    now_monotonic = time.monotonic()
-
-    with _UNDERLYING_PRICE_CACHE_LOCK:
-        cached = _UNDERLYING_PRICE_CACHE.get(symbol)
-        backoff_active = (
-            now_monotonic < _UNDERLYING_PRICE_BACKOFF_UNTIL
-            or now_monotonic < _MASSIVE_BACKOFF_UNTIL
-        )
-    if cached and now_monotonic - cached["timestamp"] <= UNDERLYING_PRICE_CACHE_TTL_SECONDS:
-        print(
-            f"{symbol} stock_price_source: cached_minute_aggregate "
-            f"price={cached['price']:.4f}"
-        )
-        return cached["price"], "cached_minute_aggregate"
-
-    if backoff_active:
-        print(f"{symbol} stock price request skipped during global 429 backoff")
-        price, source = _infer_underlying_with_parity(call_raw, put_raw)
-        print(
-            f"{symbol} stock_price_source: {source}"
-            f"{f' price={price:.4f}' if price > 0 else ' unavailable'}"
-        )
-        return price, source
-
-    if api_key:
-        try:
-            now = bot.now_new_york()
-            end_date = now.date()
-            start_date = end_date - timedelta(days=3)
-            payload = _massive_stock_get(
-                f"/v2/aggs/ticker/{symbol}/range/1/minute/"
-                f"{start_date.isoformat()}/{end_date.isoformat()}",
-                api_key,
-                {"sort": "desc", "limit": 10},
-            )
-            bars = payload.get("results") if isinstance(payload, dict) else None
-            if isinstance(bars, list):
-                bars = sorted(
-                    bars,
-                    key=lambda bar: _present_number(
-                        (bar or {}).get("t")
-                        if isinstance(bar, dict)
-                        else None
-                    ) or 0,
-                    reverse=True,
-                )
-                price = next(
-                    (
-                        _present_number(bar.get("c"))
-                        for bar in bars
-                        if isinstance(bar, dict)
-                        and _present_number(bar.get("c")) is not None
-                        and _present_number(bar.get("c")) > 0
-                    ),
-                    None,
-                )
-                if price is not None and price > 0:
-                    with _UNDERLYING_PRICE_CACHE_LOCK:
-                        _UNDERLYING_PRICE_CACHE[symbol] = {
-                            "price": price,
-                            "timestamp": time.monotonic(),
-                        }
-                    print(
-                        f"{symbol} stock_price_source: minute_aggregate price={price:.4f}"
-                    )
-                    return price, "minute_aggregate"
-        except Exception as error:
-            print(f"{symbol} minute aggregate underlying price failed: {error}")
-            response = getattr(error, "response", None)
-            if response is not None and getattr(response, "status_code", None) == 429:
-                delay = _massive_rate_limit_delay(response)
-                with _UNDERLYING_PRICE_CACHE_LOCK:
-                    _UNDERLYING_PRICE_BACKOFF_UNTIL = (
-                        time.monotonic() + delay
-                    )
-                    _MASSIVE_BACKOFF_UNTIL = max(
-                        _MASSIVE_BACKOFF_UNTIL, time.monotonic() + delay
-                    )
-                print(
-                    f"{symbol} stock price HTTP 429; global backoff "
-                    f"{delay:.0f}s"
-                )
-
-    price, source = _infer_underlying_with_parity(call_raw, put_raw)
-    if price > 0:
-        print(f"{symbol} stock_price_source: {source} price={price:.4f}")
-        return price, source
-    print(f"{symbol} stock_price_source: {source} unavailable")
-    return price, source
+    raise RuntimeError(f"Unsupported or removed data provider: {DATA_PROVIDER}")
 
 
 def _gamma_t_years(expiration, now):
@@ -4067,6 +3867,18 @@ def scan_watchlist_once(force=False, opening_window_only=False):
                 "results": [],
             }
 
+        if _provider_is_marketdata() and not _provider_token():
+            return {
+                "accepted": False,
+                "checked": 0,
+                "results": [],
+                "skipped_symbols": list(bot.WATCHLIST),
+                "incomplete": True,
+                "provider_blocked": True,
+                "provider_block_kind": "missing_key",
+                "error": "MARKETDATA_API_KEY is missing; Massive is permanently disabled",
+            }
+
         blocked_reason = (
             _marketdata_account_credit_limit_reason()
             if _provider_is_marketdata()
@@ -4430,7 +4242,9 @@ def auto_scan_loop():
                 result = scan_watchlist_once(False, opening_window_only=True)
                 counts = _scanner_result_counts(result)
                 cycle_status = (
-                    "blocked by MarketData account credit limit"
+                    "blocked: MARKETDATA_API_KEY is missing"
+                    if result.get("provider_block_kind") == "missing_key"
+                    else "blocked by MarketData account credit limit"
                     if result.get("provider_blocked")
                     else "incomplete"
                     if result.get("incomplete")
@@ -4697,8 +4511,10 @@ class CanonicalHandler(bot.Handler):
                                       "telegram_chat_id_present": bool(
                                           bot.env("TELEGRAM_CHAT_ID")
                                       ),
-                                      "massive_api_key_present": bool(
-                                          bot.env("MASSIVE_API_KEY")
+                                      "massive_enabled": False,
+                                      "provider_ready": bool(_provider_token()),
+                                      "provider_configuration_migrated": (
+                                          REQUESTED_DATA_PROVIDER in REMOVED_PROVIDERS
                                       ),
                                       "webhook_secret_present": bool(
                                           bot.env("REEF_WEBHOOK_SECRET")

@@ -7,8 +7,10 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
-      - key: MASSIVE_API_KEY
+      - key: MARKETDATA_API_KEY
         sync: false
+      - key: DATA_PROVIDER
+        value: "marketdata"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
