@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 import requests
 import macd_direction
+from marketdata_quota import MarketDataQuota
 from provider_config import PROVIDER_KEYS, REMOVED_PROVIDERS, resolve_data_provider
 
 import orca_whale_options_bot_FAST_60S_5S as bot
@@ -66,8 +67,8 @@ MARKETDATA_REQUEST_TIMEOUT = max(
 MARKETDATA_CHAIN_CACHE_TTL_SECONDS = float(
     os.getenv("MARKETDATA_CHAIN_CACHE_TTL_SECONDS", "90")
 )
-_MARKETDATA_CREDIT_LIMIT_LOCK = threading.Lock()
-_MARKETDATA_CREDIT_LIMIT_REASON = None
+_MARKETDATA_QUOTA = MarketDataQuota()
+_MARKETDATA_CHAIN_FETCH_LOCK = threading.Lock()
 
 
 SCAN_IN_PROGRESS_LOCK = threading.Lock()
@@ -1989,16 +1990,11 @@ def _provider_token():
 
 
 def _marketdata_account_credit_limit_reason():
-    with _MARKETDATA_CREDIT_LIMIT_LOCK:
-        return _MARKETDATA_CREDIT_LIMIT_REASON
+    return _MARKETDATA_QUOTA.blocked_reason()
 
 
-def _latch_marketdata_account_credit_limit(reason):
-    global _MARKETDATA_CREDIT_LIMIT_REASON
-    with _MARKETDATA_CREDIT_LIMIT_LOCK:
-        if not _MARKETDATA_CREDIT_LIMIT_REASON:
-            _MARKETDATA_CREDIT_LIMIT_REASON = str(reason)
-        return _MARKETDATA_CREDIT_LIMIT_REASON
+def _latch_marketdata_account_credit_limit(reason, headers=None):
+    return _MARKETDATA_QUOTA.block(reason, headers)
 
 
 def _marketdata_error(response, endpoint):
@@ -2021,6 +2017,7 @@ def _marketdata_get(endpoint, params=None):
     token = bot.env("MARKETDATA_API_KEY")
     if not token:
         raise RuntimeError("MARKETDATA_API_KEY is missing")
+    _MARKETDATA_QUOTA.note_request(endpoint)
     response = requests.get(
         f"{MARKETDATA_BASE_URL}{endpoint}",
         params=dict(params or {}),
@@ -2030,6 +2027,8 @@ def _marketdata_get(endpoint, params=None):
         },
         timeout=MARKETDATA_REQUEST_TIMEOUT,
     )
+    response_headers = getattr(response, "headers", {}) or {}
+    _MARKETDATA_QUOTA.observe(response_headers)
     if response.status_code not in (200, 203):
         error_message = _marketdata_error(response, endpoint)
         response_text = (
@@ -2040,7 +2039,7 @@ def _marketdata_get(endpoint, params=None):
             and "credit limit" in response_text
         ):
             blocked_reason = _latch_marketdata_account_credit_limit(
-                error_message
+                error_message, response_headers
             )
             raise MarketDataAccountCreditLimitError(blocked_reason)
         raise RuntimeError(error_message)
@@ -2127,6 +2126,13 @@ def _marketdata_records(payload):
 
 
 def _marketdata_raw_chain(symbol):
+    # A concurrent cache miss must not purchase the same complete chain twice.
+    # Do not extend the cache TTL or filter Gamma's universe to save credits.
+    with _MARKETDATA_CHAIN_FETCH_LOCK:
+        return _marketdata_raw_chain_once(symbol)
+
+
+def _marketdata_raw_chain_once(symbol):
     symbol = str(symbol or "").upper().strip()
     today = bot.now_new_york().date()
     expiration_from = (today + timedelta(days=SCORE_MIN_DTE)).isoformat()
@@ -2141,6 +2147,7 @@ def _marketdata_raw_chain(symbol):
             isinstance(cached, dict)
             and now - cached["timestamp"] <= MARKETDATA_CHAIN_CACHE_TTL_SECONDS
         ):
+            _MARKETDATA_QUOTA.note_chain_cache_hit()
             return list(cached["results"])
 
     payload = _marketdata_get(
@@ -4499,6 +4506,7 @@ class CanonicalHandler(bot.Handler):
                                  "duplicate_thread_start_prevented": _DUPLICATE_THREAD_START_PREVENTED,
                                   "configuration": {
                                        "data_provider": DATA_PROVIDER,
+                                      "marketdata_quota": _MARKETDATA_QUOTA.snapshot(),
                                         "marketdata_api_key_present": bool(
                                             bot.env("MARKETDATA_API_KEY")
                                         ),
@@ -4743,6 +4751,10 @@ bot.Handler = CanonicalHandler
 
 def main():
     """Restore durable state before handing off to the canonical HTTP server."""
+    if _provider_is_marketdata():
+        _MARKETDATA_QUOTA.configure_storage(
+            trade_state_path().with_name("marketdata_quota_state.json")
+        )
     workers = os.getenv("WEB_CONCURRENCY") or os.getenv("RENDER_WORKERS")
     if workers and workers != "1":
         print(f"WARNING: ORCA requires one application process/worker; configured workers={workers}")
