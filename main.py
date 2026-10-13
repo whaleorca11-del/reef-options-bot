@@ -24,7 +24,7 @@ import orca_whale_options_bot_FAST_60S_5S as bot
 
 # Canonical production scanner threshold for this entry point.
 bot.AUTO_SCAN_MIN_SCORE = 75.0
-bot.ENTRY_SIGNAL_DESCRIPTION = "TradingView MACD 5m 120/180/40 -> contract quality -> Telegram; Gamma informational"
+bot.ENTRY_SIGNAL_DESCRIPTION = "Autonomous ORCA contract score, Gamma and directional flow -> fresh option quote -> Telegram; no MACD/EMA200 entry gate"
 _ORIGINAL_MASSIVE_CONTRACT_SNAPSHOT = bot.massive_contract_snapshot
 
 
@@ -901,6 +901,7 @@ def _conservative_assessment(
     minimum_score=None, minimum_edge=None, allow_strong_score_exception=False,
 ):
     """Return explicit quality/price WAIT decisions for one exact candidate."""
+    direction_edge = bot.safe_float(direction_edge)
     if not contract:
         return {
             "can_open": False, "wait_status": "WAIT - DATA INCOMPLETE",
@@ -1777,228 +1778,13 @@ def _card_price_metrics(state, monitor_enabled=None):
 
 
 def render_trade_card(state):
-    """Render the approved 1080×1500 ORCA Telegram card from existing trade state."""
-    width, height = 1080, 1500
-    background = (5, 17, 29)
-    panel = (8, 25, 40)
-    detail_panel = (12, 34, 52)
-    line = (38, 63, 82)
-    white = (242, 247, 250)
-    muted = (157, 174, 188)
-    blue = (73, 171, 255)
-    green = (45, 220, 90)
-    yellow = (245, 190, 55)
-    red = (255, 69, 69)
-
-    image = bot.Image.new("RGB", (width, height), background)
-    draw = bot.ImageDraw.Draw(image)
-    for x in range(0, width, 90):
-        draw.line((x, 0, x, height), fill=(7, 24, 38), width=1)
-    for y in range(0, height, 90):
-        draw.line((0, y, width, y), fill=(7, 24, 38), width=1)
-    draw.rounded_rectangle(
-        (42, 42, width - 42, height - 42),
-        radius=36,
-        fill=panel,
-        outline=(25, 55, 76),
-        width=2,
+    """Render the user-approved card layout without changing trading behavior."""
+    from card_renderer import render_card
+    return render_card(
+        state, bot=bot, gamma_values=_card_gamma_values,
+        is_tracking=_card_is_tracking, paste_logo=_paste_card_logo,
+        signal_type=macd_direction.SIGNAL_TYPE, monitor_enabled=AUTO_MONITOR_ENABLED,
     )
-
-    symbol = str(state["symbol"]).upper()
-    company = bot.COMPANY_NAMES.get(symbol, symbol)
-    direction = str(state["direction"]).upper()
-    direction_color = green if direction == "CALL" else red
-    status = str(state.get("status", "active")).lower()
-    is_tracking = _card_is_tracking(state)
-    achieved = max(0, min(5, int(state.get("achieved", 0))))
-    entry = bot.safe_float(state["entry_price"])
-    targets = list(state["targets"])
-    stop = bot.safe_float(state["stop_loss"])
-    dte = bot._days_to_expiry(state["expiration"])
-    contract = bot.canonical_option_ticker(state["contract_ticker"])
-    gamma_flip, gamma_status = _card_gamma_values(state)
-
-    draw.text((65, 78), "ORCA WHALE OPTIONS SIGNAL", font=bot._font(39, True), fill=blue)
-    badge = _card_badge(state)
-    badge_color = (
-        yellow if status == "test"
-        else green if is_tracking
-        else blue if status == "active"
-        else red if status == "stopped"
-        else blue
-    )
-    draw.rounded_rectangle(
-        (840, 76, 980, 126),
-        radius=15,
-        fill=(
-            (62, 52, 12) if status == "test"
-            else (12, 62, 37) if is_tracking
-            else (12, 40, 62) if status == "active"
-            else (65, 25, 29)
-        ),
-    )
-    badge_font = _card_fitted_font(draw, badge, 24, 112, 17, True)
-    badge_bounds = draw.textbbox((0, 0), badge, font=badge_font)
-    draw.text(
-        (910 - (badge_bounds[2] - badge_bounds[0]) / 2, 84),
-        badge,
-        font=badge_font,
-        fill=badge_color,
-    )
-
-    logo_box = (75, 158, 250, 333)
-    draw.rounded_rectangle(
-        logo_box, radius=28, fill=(12, 41, 62), outline=(30, 85, 116), width=2
-    )
-    _paste_card_logo(image, symbol, logo_box)
-    direction_text = f"{direction} ↗" if direction == "CALL" else f"{direction} ↘"
-    draw.text((285, 166), direction_text, font=bot._font(55, True), fill=direction_color)
-    company_font = _card_fitted_font(draw, company, 30, 690, 19, True)
-    draw.text((285, 242), company, font=company_font, fill=white)
-
-    contract_box = (285, 302, 970, 370)
-    draw.rounded_rectangle(contract_box, radius=18, fill=detail_panel, outline=line, width=2)
-    contract_font = _card_fitted_font(draw, contract, 34, 625, 20, True)
-    draw.text((315, 317), contract, font=contract_font, fill=white)
-    summary = (
-        f"{symbol}  ${bot.safe_float(state['stock_price']):.2f}  {direction}   "
-        f"{state['expiration']}  ({dte}DTE)"
-    )
-    summary_font = _card_fitted_font(draw, summary, 25, 890, 18, False)
-    draw.text((75, 402), summary, font=summary_font, fill=muted)
-
-    metric_y = 480
-    for x, label, value, value_kind in _card_price_metrics(state):
-        draw.text((x, metric_y), label, font=bot._font(22, True), fill=blue)
-        if value_kind == "change":
-            font = _card_fitted_font(draw, value, 34, 300, 21, True)
-            color = green if not value.startswith("-") else red
-            draw.text((x, metric_y + 47), value, font=font, fill=color)
-        else:
-            color = yellow if value_kind == "status" else white
-            font = _card_fitted_font(draw, value, 36, 300, 22, True)
-            draw.text((x, metric_y + 47), value, font=font, fill=color)
-    draw.line((70, 602, 1010, 602), fill=line, width=2)
-
-    draw.text((75, 632), "TARGETS FROM ENTRY MID", font=bot._font(31, True), fill=blue)
-    percentages = [20, 45, 70, 100, 150]
-    target_cells = [
-        (75, 690), (390, 690), (705, 690),
-        (75, 812), (390, 812),
-    ]
-    for index, (price, percentage, (x, y)) in enumerate(
-        zip(targets, percentages, target_cells)
-    ):
-        hit = index < achieved
-        marker_color = green if hit else blue
-        draw.ellipse((x, y + 3, x + 34, y + 37), fill=panel, outline=marker_color, width=3)
-        if hit:
-            draw.text((x + 7, y + 1), "✓", font=bot._font(25, True), fill=green)
-        label_x = x + 54
-        draw.text((label_x, y), f"T{index + 1}", font=bot._font(27, True), fill=white)
-        price_text = f"${bot.safe_float(price):.2f}"
-        draw.text((label_x + 48, y), price_text, font=bot._font(27, True), fill=white)
-        draw.text(
-            (label_x + 48, y + 40),
-            f"+{percentage}%",
-            font=bot._font(22, True),
-            fill=green,
-        )
-
-    draw.rounded_rectangle(
-        (705, 807, 970, 905), radius=20, fill=(45, 20, 25), outline=(145, 38, 48), width=2
-    )
-    draw.text((728, 824), "STOP LEVEL (MID)", font=bot._font(21, True), fill=red)
-    stop_text = f"${stop:.2f}  (-45%)"
-    stop_font = _card_fitted_font(draw, stop_text, 29, 220, 22, True)
-    draw.text((728, 857), stop_text, font=stop_font, fill=white)
-
-    progress_label = (
-        f"TARGET PROGRESS   {achieved}/5"
-        if is_tracking
-        else "TARGET PROGRESS   NOT TRACKED"
-    )
-    draw.text((75, 930), progress_label, font=bot._font(24, True), fill=white)
-    progress_points = [105, 315, 525, 735, 945]
-    draw.line((105, 990, 945, 990), fill=(93, 111, 126), width=5)
-    for index, x in enumerate(progress_points):
-        hit = index < achieved
-        draw.ellipse(
-            (x - 25, 965, x + 25, 1015),
-            fill=green if hit else panel,
-            outline=green if hit else (130, 151, 167),
-            width=4,
-        )
-        if hit:
-            draw.text((x - 10, 969), "✓", font=bot._font(32, True), fill=white)
-        draw.text((x - 20, 1028), f"T{index + 1}", font=bot._font(20, True), fill=white)
-
-    draw.rounded_rectangle((70, 1085, 1010, 1355), radius=24, fill=detail_panel)
-    delta = state.get("delta")
-    iv = state.get("iv")
-    delta_text = "—" if delta in (None, "") else f"{bot.safe_float(delta):+.2f}"
-    iv_value = bot.safe_float(iv)
-    iv_text = (
-        "—"
-        if iv in (None, "")
-        else f"{(iv_value if iv_value > 3 else iv_value * 100):.1f}%"
-    )
-    details = [
-        (
-            "MACD DIRECTION" if state.get("entry_signal_type") == "MACD_5M" else "TICKER",
-            f"120/180/40 | 5m | {'GREEN' if direction == 'CALL' else 'RED'}"
-            if state.get("entry_signal_type") == "MACD_5M" else symbol,
-        ),
-        ("EXPIRATION", f"{state['expiration']} ({dte}DTE)"),
-        ("STRIKE", f"${bot.safe_float(state['strike']):.2f}"),
-        ("CONTRACT TYPE", direction),
-        ("CONTRACT", contract),
-        ("DELTA", delta_text),
-        ("IMPLIED VOLATILITY", iv_text),
-    ]
-    if gamma_flip is not None:
-        details.extend(
-            [
-                ("MODELED GAMMA FLIP", gamma_flip),
-                ("GAMMA STATUS (INFO)", gamma_status),
-            ]
-        )
-    detail_y = 1094
-    for label, value in details:
-        draw.text((105, detail_y), label, font=bot._font(17, True), fill=muted)
-        value_text = str(value)
-        value_font = _card_fitted_font(draw, value_text, 19, 610, 13, True)
-        bounds = draw.textbbox((0, 0), value_text, font=value_font)
-        draw.text(
-            (975 - (bounds[2] - bounds[0]), detail_y),
-            value_text,
-            font=value_font,
-            fill=white,
-        )
-        detail_y += 28
-
-    tracking_update = is_tracking
-    quote_time = (
-        state.get("last_successful_option_price_update")
-        if tracking_update
-        else state.get("entry_quote_timestamp") or state.get("created_at")
-    )
-    quote_label = "Quote update" if tracking_update else "Quote snapshot"
-    draw.text(
-        (75, 1392),
-        f"{quote_label} {bot.format_entry_time_et(quote_time)}",
-        font=bot._font(19),
-        fill=muted,
-    )
-    draw.text((410, 1392), f"Score {state['score']}/100", font=bot._font(19), fill=muted)
-    footer = "Powered by ORCA WHALE OPTIONS"
-    footer_font = _card_fitted_font(draw, footer, 19, 390, 15, True)
-    footer_bounds = draw.textbbox((0, 0), footer, font=footer_font)
-    draw.text((985 - (footer_bounds[2] - footer_bounds[0]), 1392), footer, font=footer_font, fill=blue)
-
-    output = Path(bot.__file__).with_name("reef_trade_card.png")
-    image.save(output, "PNG", optimize=True)
-    return output
 
 
 def _telegram_value(value, suffix="", decimals=2):
@@ -2120,12 +1906,16 @@ def telegram_send_card(state):
         image_path = None
         try:
             image_path = _render_unique_card(state)
+            send_data = {"chat_id": chat_id}
+            if str(state.get("status", "")).lower() == "test":
+                send_data["caption"] = (
+                    "اختبار إرسال بطاقة فقط — ليست توصية تداول.\n"
+                    "بيانات العقد والأسعار افتراضية؛ لم تُفتح أو تُسجّل صفقة."
+                )
             with image_path.open("rb") as image:
                 response = requests.post(
                     f"https://api.telegram.org/bot{token}/sendPhoto",
-                    data={
-                        "chat_id": chat_id,
-                    },
+                    data=send_data,
                     files={"photo": ("reef_options.png", image, "image/png")},
                     timeout=20,
                 )
@@ -3031,19 +2821,32 @@ def _massive_stock_get(path, api_key, params=None):
     return response.json()
 
 
-def _fetch_macd_5m_direction(symbol, now=None):
+def _fetch_macd_1h_direction(symbol, now=None):
     """TradingView alone supplies direction; never fall back to delayed candles."""
     now = now or bot.now_new_york()
     symbol = str(symbol).upper().strip()
-    boundary = int(now.timestamp()) // 300 * 300 - 300
     with _MACD_CACHE_LOCK:
         cached = _MACD_CACHE.get(symbol)
-        if (
-            cached and cached["bar_time_ms"] == boundary * 1000
-            and cached.get("source") == "tradingview_closed_bar"
-        ):
+        if cached and cached.get("source") == "tradingview_closed_bar":
+            macd_direction.validate_candle(cached, now)
+            if cached.get("direction") is not None:
+                macd_direction.validate_direction(cached, symbol, cached["direction"], now)
             return dict(cached)
-    raise macd_direction.MacdDataError("Waiting for the latest closed 5-minute MACD candle from TradingView")
+    raise macd_direction.MacdDataError("Waiting for a fresh closed hourly MACD/EMA200 candle from TradingView")
+
+
+def _macd_health_snapshot():
+    """Expose accepted stock signals, never credentials or raw webhook bodies."""
+    with _MACD_CACHE_LOCK:
+        signals = {symbol: dict(signal) for symbol, signal in _MACD_CACHE.items()}
+    now = bot.now_new_york()
+    for signal in signals.values():
+        try:
+            macd_direction.validate_candle(signal, now)
+            signal["fresh"] = True
+        except macd_direction.MacdDataError:
+            signal["fresh"] = False
+    return signals
 
 
 def _fetch_bot_ichimoku_30m_signal(symbol, now=None):
@@ -3480,7 +3283,7 @@ def create_trade(
     symbol, direction, stock_price, contract=None, gamma_info=None,
     trade_confidence=None, gamma_direction=None, directional_edge=None,
     scan_mode=None, required_score=None, required_edge=None,
-    allow_strong_score_exception=False, macd_signal=None,
+    allow_strong_score_exception=False,
 ):
     """Lock and open the exact contract that qualified during the scan."""
     symbol = str(symbol or "").upper().strip()
@@ -3489,20 +3292,13 @@ def create_trade(
         raise RuntimeError(f"{symbol} is excluded from contract selection")
     if bot.safe_float(stock_price) <= 0:
         raise RuntimeError("Underlying price unavailable; refusing to lock a contract")
-    macd_signal = _fetch_macd_5m_direction(symbol)
-    macd_direction.validate_direction(macd_signal, symbol, direction, bot.now_new_york())
-    if required_score is None:
-        required_score = _scan_mode_context()["required_score"]
     if contract is None:
         # Manual contract selection: use the canonical, fully-paginated path
         # and calculate Gamma from that same full contract universe.
         call_raw = massive_chain(symbol, "CALL")
         put_raw = massive_chain(symbol, "PUT")
         if gamma_info is None:
-            try:
-                gamma_info = calculate_gamma_flip(call_raw, put_raw, stock_price)
-            except Exception:
-                gamma_info = {"status": "INSUFFICIENT DATA", "regime": "UNAVAILABLE"}
+            gamma_info = calculate_gamma_flip(call_raw, put_raw, stock_price)
         calls, _ = _prepare_side(call_raw, stock_price)
         puts, _ = _prepare_side(put_raw, stock_price)
         with bot.TRADE_STATE_LOCK:
@@ -3514,8 +3310,16 @@ def create_trade(
         call_stats, put_stats = _side_flow_stats(calls), _side_flow_stats(puts)
         requested = calls if direction == "CALL" else puts
         contract = requested[0] if requested else None
-        assessment = _macd_contract_assessment(
-            direction, contract, gamma_info, stock_price, required_score
+        call_strength = bot._direction_strength(call_stats, put_stats)
+        put_strength = bot._direction_strength(put_stats, call_stats)
+        directional_edge = (
+            call_strength - put_strength if direction == "CALL"
+            else put_strength - call_strength
+        )
+        assessment = _conservative_assessment(
+            direction, contract, directional_edge, gamma_info, stock_price,
+            minimum_score=required_score, minimum_edge=required_edge,
+            allow_strong_score_exception=allow_strong_score_exception,
         )
         if not assessment["can_open"]:
             raise RuntimeError(assessment["wait_status"])
@@ -3546,16 +3350,15 @@ def create_trade(
             symbol, contract, stock_price
         )
         entry, source = bot.choose_initial_price(contract)
-        assessment = _macd_contract_assessment(
-            direction, contract, gamma_info, stock_price, required_score,
+        assessment = _conservative_assessment(
+            direction, contract, directional_edge, gamma_info, stock_price,
+            minimum_score=required_score, minimum_edge=required_edge,
+            allow_strong_score_exception=allow_strong_score_exception,
         )
         if not assessment["can_open"]:
             raise RuntimeError(assessment["wait_status"])
         if entry <= 0 or source != "Fresh Bid/Ask Midpoint":
             raise RuntimeError("WAIT - FRESH OPTION MIDPOINT REQUIRED")
-        # Re-check after quote retrieval: a new closed candle may have changed side.
-        macd_signal = _fetch_macd_5m_direction(symbol)
-        macd_direction.validate_direction(macd_signal, symbol, direction, bot.now_new_york())
         trade_confidence = assessment["trade_confidence"]
         gamma_direction = assessment["gamma_direction_state"]
         quote_timestamp = contract.get("quote_timestamp")
@@ -3594,14 +3397,13 @@ def create_trade(
             "iv": contract.get("iv"),
             "theta": contract.get("theta"),
             "theta_delta_ratio": contract.get("theta_delta_ratio"),
-            "directional_edge": None,
+            "directional_edge": directional_edge,
             "scan_mode": scan_mode,
             "required_score": required_score,
-            "required_edge": None,
-            "entry_signal_type": "MACD_5M",
-            "entry_signal_bar_time_ms": macd_signal["bar_time_ms"],
-            "macd": dict(macd_signal),
-            "gamma_policy": "diagnostic_only",
+            "required_edge": required_edge,
+            "entry_signal_type": "ORCA_SCORE_GAMMA",
+            "entry_signal_bar_time_ms": None,
+            "gamma_policy": "directional_quality",
             "gamma_direction_state": gamma_direction or gamma_direction_state(
                 direction, stock_price, gamma_info
             ),
@@ -3962,7 +3764,7 @@ def _marketdata_blocked_symbol_result(symbol, reason):
 
 
 def scan_symbol_options(symbol):
-    """MACD selects the only tradable side; contract quality still gates sends."""
+    """Evaluate CALL and PUT independently using the pre-MACD ORCA policy."""
     symbol = str(symbol or "").upper().strip()
     if symbol in bot.EXCLUDED_SYMBOLS:
         return {
@@ -3979,26 +3781,6 @@ def scan_symbol_options(symbol):
     if blocked_reason:
         return _marketdata_blocked_symbol_result(symbol, blocked_reason)
     scan_context = _scan_mode_context()
-    try:
-        macd_signal = _fetch_macd_5m_direction(symbol)
-    except macd_direction.MacdDataError as error:
-        result = {
-            "symbol": symbol, "accepted": False, "status": "WAIT - MACD DATA",
-            "ignored": str(error), "entry_signal_mode": "MACD_5M",
-            "call": {"accepted": False, "reason": str(error)},
-            "put": {"accepted": False, "reason": str(error)},
-        }
-        _LAST_SCAN_DECISIONS[symbol] = dict(result)
-        return result
-    if macd_signal["direction"] is None:
-        result = {
-            "symbol": symbol, "accepted": False, "status": "WAIT - MACD ZERO",
-            "ignored": "MACD histogram is exactly zero", "macd": macd_signal,
-            "call": {"accepted": False, "reason": "MACD zero"},
-            "put": {"accepted": False, "reason": "MACD zero"},
-        }
-        _LAST_SCAN_DECISIONS[symbol] = dict(result)
-        return result
 
     with bot.TRADE_STATE_LOCK:
         store = bot._load_trade_store()
@@ -4021,15 +3803,8 @@ def scan_symbol_options(symbol):
         _clear_pending_candidate(symbol)
         pending_candidate = None
 
-    selected_side = macd_signal["direction"]
-    selected_raw = massive_chain(symbol, selected_side)
-    try:
-        opposite_raw = massive_chain(symbol, "PUT" if selected_side == "CALL" else "CALL")
-    except Exception:
-        opposite_raw = []
-        print(f"{symbol} Gamma diagnostic chain unavailable; MACD direction unchanged")
-    call_raw = selected_raw if selected_side == "CALL" else opposite_raw
-    put_raw = selected_raw if selected_side == "PUT" else opposite_raw
+    call_raw = massive_chain(symbol, "CALL")
+    put_raw = massive_chain(symbol, "PUT")
     stock_price, stock_source = fetch_underlying_price(symbol, call_raw, put_raw)
     if stock_price <= 0:
         return {
@@ -4043,11 +3818,7 @@ def scan_symbol_options(symbol):
             "ignored": "underlying price unavailable",
         }
 
-    try:
-        gamma_info = bot.calculate_gamma_flip(call_raw, put_raw, stock_price)
-    except Exception:
-        # Diagnostic information must never veto a MACD-selected contract.
-        gamma_info = {"status": "INSUFFICIENT DATA", "regime": "UNAVAILABLE"}
+    gamma_info = bot.calculate_gamma_flip(call_raw, put_raw, stock_price)
 
     calls, call_exp = bot._prepare_side(call_raw, stock_price)
     puts, put_exp = bot._prepare_side(put_raw, stock_price)
@@ -4071,46 +3842,53 @@ def scan_symbol_options(symbol):
         scan_context,
     )
     assessments = {}
-    for direction, diagnostic, stats in (
-        ("CALL", call_diag, call_stats), ("PUT", put_diag, put_stats),
-    ):
-        assessment = _macd_contract_assessment(
-            direction, stats.get("best"), gamma_info, stock_price,
-            scan_context["required_score"],
+    if ORCA_CONSERVATIVE_MODE:
+        assessment_requirements = {}
+        if scan_context["scan_mode"] == "OPENING_FAST":
+            assessment_requirements = {
+                "minimum_score": scan_context["required_score"],
+                "minimum_edge": scan_context["required_edge"],
+                "allow_strong_score_exception": scan_context["allow_strong_score_exception"],
+            }
+        assessments["CALL"] = _conservative_assessment(
+            "CALL", call_stats.get("best"), call_strength - put_strength,
+            gamma_info, stock_price, **assessment_requirements,
         )
-        reasons = list(assessment["wait_reasons"])
-        if direction != macd_signal["direction"]:
-            reasons.insert(0, "WAIT - OPPOSITE MACD DIRECTION")
-        assessment.update(
-            wait_reasons=reasons, wait_status=reasons[0] if reasons else "TRADE",
-            can_open=not reasons,
+        assessments["PUT"] = _conservative_assessment(
+            "PUT", put_stats.get("best"), put_strength - call_strength,
+            gamma_info, stock_price, **assessment_requirements,
         )
-        assessments[direction] = assessment
-        diagnostic.update(
-            accepted=assessment["can_open"],
-            trade_confidence=assessment["trade_confidence"],
-            wait_status=assessment["wait_status"], wait_reasons=reasons,
-            entry_price_quality=assessment.get("entry_source"),
-            gamma_direction_state=assessment["gamma_direction_state"],
-            gamma_policy="diagnostic_only",
-            edge_policy="diagnostic_only", strong_score_exception=False,
-            checks={
-                "macd_direction": direction == macd_signal["direction"],
-                "contract_quality": not assessment["wait_reasons"]
-                or assessment["wait_reasons"] == ["WAIT - OPPOSITE MACD DIRECTION"],
-            },
-            reason="qualified" if not reasons else "; ".join(reasons),
+        ambiguous = bool(
+            call_stats.get("best") and put_stats.get("best")
+            and abs(call_strength - put_strength) < ORCA_MIN_DIRECTION_EDGE
         )
+        for direction, diagnostic in (("CALL", call_diag), ("PUT", put_diag)):
+            assessment = assessments[direction]
+            reasons = list(assessment["wait_reasons"])
+            if ambiguous:
+                reasons.insert(0, "WAIT - DIRECTION UNCLEAR")
+            reasons = list(dict.fromkeys(reasons))
+            assessment.update(
+                wait_reasons=reasons, wait_status=reasons[0] if reasons else "TRADE",
+                can_open=not reasons,
+            )
+            diagnostic.update(
+                accepted=assessment["can_open"],
+                trade_confidence=assessment["trade_confidence"],
+                wait_status=assessment["wait_status"], wait_reasons=reasons,
+                entry_price_quality=assessment["entry_source"],
+                gamma_direction_state=assessment["gamma_direction_state"],
+                reason="qualified" if not reasons else "; ".join(reasons),
+            )
 
     result = {
         "symbol": symbol,
         "accepted": True,
-        "entry_signal_mode": "MACD_5M",
-        "macd": macd_signal,
-        "gamma_policy": "diagnostic_only",
+        "entry_signal_mode": "ORCA_SCORE_GAMMA",
+        "gamma_policy": "directional_quality",
         "scan_mode": scan_context["scan_mode"],
         "required_score": scan_context["required_score"],
-        "required_edge": None,
+        "required_edge": scan_context["required_edge"],
         "stock_price": round(stock_price, 2),
         "stock_price_source": stock_source,
         "call": call_diag,
@@ -4161,13 +3939,20 @@ def scan_symbol_options(symbol):
         qualified.append(("PUT", put_stats["best"], put_strength))
 
     if not qualified:
-        preferred_direction = macd_signal["direction"]
-        preferred_contract = (
-            call_stats if preferred_direction == "CALL" else put_stats
-        ).get("best")
+        available = [
+            (direction, stats["best"], strength)
+            for direction, stats, strength in (
+                ("CALL", call_stats, call_strength), ("PUT", put_stats, put_strength)
+            ) if stats.get("best")
+        ]
+        if available:
+            preferred_direction, preferred_contract, _ = max(available, key=lambda item: item[2])
+        else:
+            preferred_direction = "CALL" if call_strength >= put_strength else "PUT"
+            preferred_contract = None
         assessment = assessments.get(preferred_direction)
         if (
-            preferred_contract and assessment
+            ORCA_CONSERVATIVE_MODE and preferred_contract and assessment
             and "WAITING FOR PRICE CONFIRMATION" in assessment["wait_reasons"]
             and not any(
                 reason not in (
@@ -4188,13 +3973,12 @@ def scan_symbol_options(symbol):
                 assessment.get("wait_status")
                 if assessment else "WAIT - NO QUALIFIED DIRECTION"
             )
-        result["ignored"] = "MACD-selected side has no qualified contract"
+        result["ignored"] = "neither CALL nor PUT qualified"
         _LAST_SCAN_DECISIONS[symbol] = {
             "status": result["status"],
             "preferred_contract": result.get("preferred_contract"),
             "call": _scan_decision_summary(call_diag),
             "put": _scan_decision_summary(put_diag),
-            "macd": dict(macd_signal),
             "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
         }
         return result
@@ -4206,12 +3990,11 @@ def scan_symbol_options(symbol):
         symbol, direction, stock_price, contract=contract, gamma_info=gamma_info,
         trade_confidence=(assessment or {}).get("trade_confidence"),
         gamma_direction=(assessment or {}).get("gamma_direction_state"),
-        directional_edge=None,
+        directional_edge=call_diag["edge"] if direction == "CALL" else put_diag["edge"],
         scan_mode=scan_context["scan_mode"],
         required_score=scan_context["required_score"],
-        required_edge=None,
-        allow_strong_score_exception=False,
-        macd_signal=macd_signal,
+        required_edge=scan_context["required_edge"],
+        allow_strong_score_exception=scan_context["allow_strong_score_exception"],
     )
     if state.get("_ignored_duplicate"):
         result["status"] = "DUPLICATE CONTRACT"
@@ -4227,7 +4010,6 @@ def scan_symbol_options(symbol):
         "status": "TRADE",
         "contract": state.get("contract_ticker"),
         "confidence": state.get("trade_confidence"),
-        "macd": dict(macd_signal),
         "direction": direction,
         "scan_mode": scan_context["scan_mode"],
         "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
@@ -4878,10 +4660,12 @@ class CanonicalHandler(bot.Handler):
         self.json_response(200, {"ok": True, "service": "ORCA WHALE OPTIONS BOT",
                                   "conservative_mode": ORCA_CONSERVATIVE_MODE,
                                   "conservative_min_score": ORCA_CONSERVATIVE_MIN_SCORE,
-                                  "minimum_direction_edge": None,
-                                  "gamma_direction_gate_enabled": False,
+                                  "minimum_direction_edge": ORCA_MIN_DIRECTION_EDGE,
+                                  "gamma_direction_gate_enabled": True,
+                                  "macd_entry_gate_enabled": False,
                                   "data_feed_mode": "delayed/non-paid compatible; not claimed real-time",
                                   "last_scan_decisions": dict(_LAST_SCAN_DECISIONS),
+                                  "tradingview_signals": _macd_health_snapshot(),
                                   "pending_price_confirmation": pending,
                                   "paper_performance": performance,
                                   "scanner_interval_seconds": getattr(bot, "AUTO_SCAN_SECONDS", 3600),
@@ -4928,12 +4712,16 @@ class CanonicalHandler(bot.Handler):
                                         "auto_scan_opening_interval_seconds": (
                                             AUTO_SCAN_OPENING_INTERVAL_SECONDS
                                         ),
-                                        "entry_signal_mode": "MACD_5M",
+                                        "entry_signal_mode": "ORCA_SCORE_GAMMA",
                                         "macd_settings": {
+                                            "entry_gate_enabled": False,
                                             "fast": 120, "slow": 180, "signal": 40,
-                                            "signal_average": "SMA", "timeframe_minutes": 5,
+                                             "signal_average": "SMA", "timeframe_minutes": 60,
+                                             "ema_length": 200, "ema_average": "EMA",
+                                             "price_rule": "above_for_call_below_for_put",
+                                             "new_cross_required": False,
                                             "closed_candles_only": True,
-                                            "gamma_policy": "diagnostic_only",
+                                            "gamma_policy": "directional_quality",
                                             "source": "TradingView /macd-signal",
                                         },
                                         "ichimoku_entry_gate_enabled": False,
@@ -4980,18 +4768,23 @@ class CanonicalHandler(bot.Handler):
                 return
             with _MACD_CACHE_LOCK:
                 previous = _MACD_CACHE.get(signal["symbol"])
+                if previous and previous["bar_close_time_ms"] > signal["bar_close_time_ms"]:
+                    self.json_response(409, {"error": "out-of-order hourly candle"})
+                    return
                 if (
                     previous and previous.get("source") == "tradingview_closed_bar"
                     and previous.get("bar_time_ms") == signal["bar_time_ms"]
-                    and previous.get("histogram") != signal["histogram"]
+                    and any(previous.get(field) != signal[field]
+                            for field in ("histogram", "macd", "signal", "price", "ema200"))
                 ):
                     self.json_response(409, {"error": "conflicting values for an already closed candle"})
                     return
-                _MACD_CACHE[signal["symbol"]] = dict(signal)
+                _MACD_CACHE[signal["symbol"]] = {**signal, "received_at": bot.now_new_york().isoformat()}
             # Cache a heartbeat, not a second scanner. Preserve the approved cadence.
             self.json_response(200, {
                 "accepted": True, "cached": True, "signal": signal,
-                "note": "direction will be used by the scheduled ORCA scan; no alert sent by this request",
+                "used_for_entry": False,
+                "note": "diagnostic cache only; MACD/EMA200 entry gates are disabled; no alert sent by this request",
             })
             return
         if not AUTO_MONITOR_ENABLED and path in ("/monitor-tick", "/option-price"):
@@ -5004,7 +4797,7 @@ class CanonicalHandler(bot.Handler):
                 "accepted": False,
                 "error": (
                     "Entry webhooks are disabled; ORCA qualifies contracts "
-                    "using its MACD direction and contract-quality scan."
+                    "using contract quality, Gamma and directional flow."
                 ),
             })
             return
@@ -5055,7 +4848,7 @@ class CanonicalHandler(bot.Handler):
                     self.json_response(410, {
                         "error": (
                             "entry webhooks are disabled; ORCA selects contracts "
-                            "using MACD direction and contract-quality filters"
+                            "using contract quality, Gamma and directional flow"
                         ),
                         "signal_type": signal_type or None,
                         "ticker": payload.get("ticker"),

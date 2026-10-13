@@ -258,8 +258,8 @@ class ThirtyMinuteIchimokuGateTests(unittest.TestCase):
         }
 
         with (
-            patch.object(app, "_fetch_macd_5m_direction", return_value={"direction": "CALL"}),
-            patch.object(app, "_macd_contract_assessment", return_value={
+            patch.object(app, "_fetch_macd_1h_direction", return_value={"direction": "CALL"}),
+            patch.object(app, "_conservative_assessment", return_value={
                 "can_open": True, "wait_reasons": [], "wait_status": "TRADE",
                 "trade_confidence": {"level": "HIGH", "score": 90, "components": {}},
                 "gamma_direction_state": "confirmed", "entry_source": "Fresh Bid/Ask Midpoint",
@@ -301,7 +301,7 @@ class ThirtyMinuteIchimokuGateTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "TRADE")
         self.assertEqual(result["direction"], "CALL")
-        self.assertEqual(result["entry_signal_mode"], "MACD_5M")
+        self.assertEqual(result["entry_signal_mode"], "ORCA_SCORE_GAMMA")
         create_trade.assert_called_once()
 
     def test_create_trade_does_not_require_ichimoku_signal(self):
@@ -315,9 +315,12 @@ class ThirtyMinuteIchimokuGateTests(unittest.TestCase):
 
         with (
             patch.object(bot, "now_new_york", return_value=self.now),
-            patch.object(app, "_fetch_macd_5m_direction", return_value={
-                "symbol": "AAPL", "direction": "CALL", "signal_type": "MACD_5M",
-                "bar_time_ms": (int(self.now.timestamp()) // 300 * 300 - 300) * 1000,
+            patch.object(app, "_fetch_macd_1h_direction", return_value={
+                "symbol": "AAPL", "direction": "CALL", "signal_type": "MACD_1H_EMA200",
+                "timeframe": "60", "ema_length": 200, "ema_average": "EMA",
+                "price": 215, "ema200": 200,
+                "bar_time_ms": (((int(self.now.timestamp()) - 1800) // 3600) * 3600 - 1800) * 1000,
+                "bar_close_time_ms": (((int(self.now.timestamp()) - 1800) // 3600) * 3600 + 1800) * 1000,
                 "histogram": 0.1,
             }),
             patch.object(bot, "_load_trade_store", side_effect=lambda: store),
@@ -348,7 +351,7 @@ class ThirtyMinuteIchimokuGateTests(unittest.TestCase):
                     "dte": 16,
                 },
             ),
-            patch.object(app, "_macd_contract_assessment", return_value={
+            patch.object(app, "_conservative_assessment", return_value={
                 "can_open": True,
                 "trade_confidence": {"level": "HIGH", "score": 90, "components": {}},
                 "gamma_direction_state": "confirmed",
@@ -360,7 +363,7 @@ class ThirtyMinuteIchimokuGateTests(unittest.TestCase):
             )
 
         self.assertEqual(trade["status"], "active")
-        self.assertEqual(trade["entry_signal_type"], "MACD_5M")
+        self.assertEqual(trade["entry_signal_type"], "ORCA_SCORE_GAMMA")
         self.assertEqual(trade["message_id"], 12)
 
 

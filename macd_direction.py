@@ -1,8 +1,8 @@
-"""CM_Ult_MacD_MTF-compatible direction from completed 5-minute bars.
+"""CM_Ult_MacD_MTF-compatible hourly stock direction with EMA200.
 
 EMA(close, 120) - EMA(close, 180), with SMA(MACD, 40) as signal.
 Extended-session candles match the chart supplied by the user. The histogram
-sign, not its changing shade or a price moving-average crossing, selects side.
+sign and price position relative to EMA200 must agree; no new cross is needed.
 """
 
 import math
@@ -10,12 +10,56 @@ import math
 FAST = 120
 SLOW = 180
 SIGNAL = 40
-BAR_SECONDS = 300
+BAR_SECONDS = 3600
+SIGNAL_TYPE = "MACD_1H_EMA200"
+EMA_LENGTH = 200
 MIN_BARS = SLOW * 6
 
 
 class MacdDataError(ValueError):
     pass
+
+
+def ema(closes, length=EMA_LENGTH):
+    if len(closes) < length:
+        raise MacdDataError("EMA200 needs at least 200 completed candles")
+    value = float(closes[0])
+    for close in closes:
+        close = float(close)
+        if not math.isfinite(close) or close <= 0:
+            raise MacdDataError("Invalid EMA200 candle")
+        value += (close - value) * (2.0 / (length + 1))
+    return value
+
+
+def stock_direction(hist, price, ema200):
+    """Select a side only when both stock conditions agree."""
+    if not all(math.isfinite(v) for v in (hist, price, ema200)) or min(price, ema200) <= 0:
+        raise MacdDataError("Invalid hourly MACD/EMA200 values")
+    if hist > 0 and price > ema200:
+        return "CALL"
+    if hist < 0 and price < ema200:
+        return "PUT"
+    return None
+
+
+def validate_candle(signal, now):
+    """Validate actual TradingView close times, including :30 US session bars."""
+    start = signal.get("bar_time_ms")
+    end = signal.get("bar_close_time_ms")
+    if (
+        type(start) is not int or type(end) is not int
+        or start % 60000 or end % 60000
+        or end - start not in (1800000, 3600000)
+        or not 0 <= now.timestamp() * 1000 - end < BAR_SECONDS * 1000
+    ):
+        raise MacdDataError("Hourly candle is stale, future, or not yet closed")
+    local_start = now.fromtimestamp(start / 1000, now.tzinfo)
+    local_end = now.fromtimestamp(end / 1000, now.tzinfo)
+    if local_start.minute not in (0, 30) or local_start.weekday() >= 5:
+        raise MacdDataError("Hourly candle is not aligned to a trading session")
+    if end - start == 1800000 and (local_end.hour, local_end.minute) not in ((9, 30), (16, 0)):
+        raise MacdDataError("Short hourly candle must end at a session boundary")
 
 
 def histogram(closes):
@@ -37,7 +81,6 @@ def histogram(closes):
 
 def from_bars(symbol, bars, now):
     """Reject stale/partial data; never infer direction from an unfinished bar."""
-    expected_start = int(now.timestamp()) // BAR_SECONDS * BAR_SECONDS - BAR_SECONDS
     completed = {}
     for bar in bars or []:
         if not isinstance(bar, dict):
@@ -49,9 +92,7 @@ def from_bars(symbol, bars, now):
             raise MacdDataError("MACD candle is missing timestamp/close") from None
         if not math.isfinite(start) or not math.isfinite(close) or close <= 0:
             raise MacdDataError("Invalid MACD candle")
-        if int(start) % BAR_SECONDS:
-            raise MacdDataError("MACD candle is not aligned to five minutes")
-        if start > expected_start:
+        if start + BAR_SECONDS > now.timestamp():
             continue
         local = now.fromtimestamp(start, now.tzinfo)
         if local.weekday() >= 5 or not 4 <= local.hour < 20:
@@ -59,39 +100,49 @@ def from_bars(symbol, bars, now):
         if start in completed and completed[start] != close:
             raise MacdDataError("Conflicting duplicate MACD candles")
         completed[start] = close
-    if not completed or max(completed) != expected_start:
-        raise MacdDataError("Latest closed five-minute candle is unavailable or delayed")
+    if not completed:
+        raise MacdDataError("Latest closed hourly candle is unavailable")
     times = sorted(completed)
+    latest = times[-1]
+    candle = {"bar_time_ms": int(latest * 1000),
+              "bar_close_time_ms": int((latest + BAR_SECONDS) * 1000)}
+    validate_candle(candle, now)
     macd, signal, hist = histogram([completed[t] for t in times])
-    direction = "CALL" if hist > 0 else "PUT" if hist < 0 else None
+    ema200 = ema([completed[t] for t in times])
+    direction = stock_direction(hist, completed[latest], ema200)
     return {
         "symbol": symbol, "direction": direction,
-        "signal_type": "MACD_5M", "timeframe": "5",
+        "signal_type": SIGNAL_TYPE, "timeframe": "60",
         "fast": FAST, "slow": SLOW, "signal_length": SIGNAL,
-        "signal_average": "SMA", "source": "massive_5m_extended",
+        "signal_average": "SMA", "source": "massive_1h_extended",
         "macd": macd, "signal": signal, "histogram": hist,
-        "bar_time_ms": expected_start * 1000,
-        "bar_close_time_ms": (expected_start + BAR_SECONDS) * 1000,
-        "price": completed[times[-1]], "completed_candles": len(times),
+        **candle, "price": completed[latest], "completed_candles": len(times),
+        "ema200": ema200, "ema_length": EMA_LENGTH, "ema_average": "EMA",
     }
 
 
 def validate_direction(signal, symbol, direction, now):
-    expected = (int(now.timestamp()) // BAR_SECONDS * BAR_SECONDS - BAR_SECONDS) * 1000
     if (
         not isinstance(signal, dict)
         or signal.get("symbol") != symbol
-        or signal.get("signal_type") != "MACD_5M"
-        or signal.get("bar_time_ms") != expected
+        or signal.get("signal_type") != SIGNAL_TYPE
+        or signal.get("timeframe") != "60"
+        or signal.get("ema_length") != EMA_LENGTH
+        or signal.get("ema_average") != "EMA"
         or signal.get("direction") != direction
         or direction not in ("CALL", "PUT")
     ):
-        raise MacdDataError("No fresh MACD confirmation for the requested contract direction")
+        raise MacdDataError("No hourly MACD/EMA200 confirmation for the requested side")
+    validate_candle(signal, now)
     hist = signal.get("histogram")
     if not isinstance(hist, (int, float)) or not math.isfinite(hist):
         raise MacdDataError("Invalid MACD histogram")
-    if (direction == "CALL" and hist <= 0) or (direction == "PUT" and hist >= 0):
-        raise MacdDataError("MACD histogram contradicts the requested direction")
+    try:
+        actual = stock_direction(hist, float(signal["price"]), float(signal["ema200"]))
+    except (KeyError, TypeError, ValueError):
+        raise MacdDataError("Missing hourly stock price/EMA200 confirmation") from None
+    if actual != direction:
+        raise MacdDataError("Hourly MACD and EMA200 price position do not agree")
 
 
 def from_webhook(payload, now, watchlist, excluded):
@@ -100,37 +151,36 @@ def from_webhook(payload, now, watchlist, excluded):
     if not symbol or symbol not in watchlist or symbol in excluded:
         raise MacdDataError("MACD ticker is not permitted")
     if (
-        payload.get("signal_type") != "MACD_5M"
-        or str(payload.get("timeframe")) != "5"
+        payload.get("signal_type") != SIGNAL_TYPE
+        or str(payload.get("timeframe")) != "60"
         or payload.get("fast") != FAST or payload.get("slow") != SLOW
         or payload.get("signal_length") != SIGNAL
         or payload.get("signal_average") != "SMA"
         or payload.get("bar_closed") is not True
+        or payload.get("ema_length") != EMA_LENGTH
+        or payload.get("ema_average") != "EMA"
     ):
-        raise MacdDataError("MACD webhook must use closed 5-minute bars and EMA 120/180, SMA 40")
-    expected_start = int(now.timestamp()) // BAR_SECONDS * BAR_SECONDS - BAR_SECONDS
-    if (
-        payload.get("bar_time_ms") != expected_start * 1000
-        or payload.get("bar_close_time_ms") != (expected_start + BAR_SECONDS) * 1000
-    ):
-        raise MacdDataError("MACD webhook candle is stale, future, or not yet closed")
+        raise MacdDataError("Use closed 60-minute bars, MACD EMA120/180 SMA40, and EMA200")
+    validate_candle(payload, now)
     try:
         line = float(payload["macd"])
         average = float(payload["signal"])
         hist = float(payload["histogram"])
         price = float(payload["price"])
+        ema200 = float(payload["ema200"])
     except (KeyError, TypeError, ValueError):
-        raise MacdDataError("MACD webhook requires numeric indicator values and price") from None
-    if not all(math.isfinite(v) for v in (line, average, hist, price)) or price <= 0:
+        raise MacdDataError("Hourly webhook requires numeric MACD, price, and EMA200") from None
+    if not all(math.isfinite(v) for v in (line, average, hist, price, ema200)) or min(price, ema200) <= 0:
         raise MacdDataError("Invalid MACD webhook values")
     if not math.isclose(hist, line - average, rel_tol=1e-8, abs_tol=1e-8):
         raise MacdDataError("MACD webhook histogram does not match MACD minus signal")
     return {
-        "symbol": symbol, "direction": "CALL" if hist > 0 else "PUT" if hist < 0 else None,
-        "signal_type": "MACD_5M", "timeframe": "5",
+        "symbol": symbol, "direction": stock_direction(hist, price, ema200),
+        "signal_type": SIGNAL_TYPE, "timeframe": "60",
         "fast": FAST, "slow": SLOW, "signal_length": SIGNAL,
         "signal_average": "SMA", "source": "tradingview_closed_bar",
         "macd": line, "signal": average, "histogram": hist, "price": price,
-        "bar_time_ms": expected_start * 1000,
-        "bar_close_time_ms": (expected_start + BAR_SECONDS) * 1000,
+        "bar_time_ms": payload["bar_time_ms"],
+        "bar_close_time_ms": payload["bar_close_time_ms"],
+        "ema200": ema200, "ema_length": EMA_LENGTH, "ema_average": "EMA",
     }

@@ -54,9 +54,12 @@ class MultiContractTradeTests(unittest.TestCase):
         contract = option("AAPL261022C00220000")
 
         with (
-            patch.object(app, "_fetch_macd_5m_direction", side_effect=lambda *_a, **_k: {
-                "symbol": "AAPL", "direction": "CALL", "signal_type": "MACD_5M",
-                "bar_time_ms": (int(bot.now_new_york().timestamp()) // 300 * 300 - 300) * 1000,
+            patch.object(app, "_fetch_macd_1h_direction", side_effect=lambda *_a, **_k: {
+                "symbol": "AAPL", "direction": "CALL", "signal_type": "MACD_1H_EMA200",
+                "timeframe": "60", "ema_length": 200, "ema_average": "EMA",
+                "price": 220, "ema200": 200,
+                "bar_time_ms": (((int(bot.now_new_york().timestamp()) - 1800) // 3600) * 3600 - 1800) * 1000,
+                "bar_close_time_ms": (((int(bot.now_new_york().timestamp()) - 1800) // 3600) * 3600 + 1800) * 1000,
                 "histogram": 0.1,
             }),
             patch.object(bot, "_load_trade_store", side_effect=lambda: store),
@@ -68,7 +71,7 @@ class MultiContractTradeTests(unittest.TestCase):
                 app, "refresh_contract_quote_for_entry",
                 side_effect=lambda _symbol, candidate, _stock: fresh_entry_contract(candidate),
             ),
-            patch.object(app, "_macd_contract_assessment", return_value={
+            patch.object(app, "_conservative_assessment", return_value={
                 "can_open": True,
                 "trade_confidence": {"level": "HIGH", "score": 90, "components": {}},
                 "gamma_direction_state": "confirmed",
@@ -134,8 +137,8 @@ class MultiContractTradeTests(unittest.TestCase):
             }
 
         with (
-            patch.object(app, "_fetch_macd_5m_direction", return_value={"direction": "CALL"}),
-            patch.object(app, "_macd_contract_assessment", return_value={
+            patch.object(app, "_fetch_macd_1h_direction", return_value={"direction": "CALL"}),
+            patch.object(app, "_conservative_assessment", return_value={
                 "can_open": True, "wait_reasons": [], "wait_status": "TRADE",
                 "trade_confidence": {"level": "HIGH", "score": 90, "components": {}},
                 "gamma_direction_state": "confirmed", "entry_source": "Fresh Bid/Ask Midpoint",
