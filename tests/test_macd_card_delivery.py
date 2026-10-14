@@ -31,7 +31,7 @@ class MacdCardDeliveryTests(unittest.TestCase):
                 self.assertEqual(image.size, (1080, 1620))
             calls = {call.args[2]: call for call in text.call_args_list}
             self.assertIn("PUT ↘", calls)
-            self.assertIn("UNAVAILABLE", calls)
+            self.assertFalse(any("GAMMA" in label for label in calls))
             self.assertIn("N/A", calls)
             self.assertEqual(len({
                 calls[f"${target:.2f}"].args[1][1] for target in state["targets"]
@@ -47,6 +47,39 @@ class MacdCardDeliveryTests(unittest.TestCase):
             self.assertNotIn("CONTRACT", calls)
             self.assertNotIn(app.bot.COMPANY_NAMES.get("NVDA", "NVDA"), calls)
             self.assertEqual(state, original)
+
+    def test_gamma_is_absent_even_from_historical_card_state(self):
+        base = {
+            "symbol": "AAPL", "direction": "CALL", "status": "active",
+            "stock_price": 345.79, "expiration": "2026-10-30",
+            "contract_ticker": "AAPL261030C00350000", "strike": 350,
+            "entry_price": 5.35, "midpoint": 5.35, "bid": 5.25, "ask": 5.45,
+            "targets": [6.42, 7.76, 9.09, 10.70, 13.38],
+            "stop_loss": 2.94, "score": 86.9, "delta": 0.43, "iv": 0.233,
+            "gamma_flip": 326.97, "gamma_status": "FOUND",
+            "gamma_regime": "POSITIVE",
+        }
+        for policy in ("disabled", "directional_quality"):
+            state = {**base, "gamma_policy": policy}
+            original = copy.deepcopy(state)
+            with (
+                self.subTest(policy=policy),
+                tempfile.TemporaryDirectory() as tmp,
+                patch.object(app.bot, "__file__", str(Path(tmp) / "template.py")),
+                patch.object(app, "_card_gamma_values",
+                             side_effect=AssertionError("Gamma must not render")),
+                patch.object(app.bot.ImageDraw.ImageDraw, "text", autospec=True) as text,
+            ):
+                app.render_trade_card(state)
+                labels = [call.args[2] for call in text.call_args_list]
+                self.assertFalse(any("GAMMA" in label for label in labels))
+                self.assertNotIn("OFF", labels)
+                self.assertNotIn("DISABLED", labels)
+                self.assertNotIn("$326.97", labels)
+                for expected in ("DELTA", "+0.43", "IMPLIED VOLATILITY", "23.3%",
+                                 "$5.350", "$2.94", "$350.00"):
+                    self.assertIn(expected, labels)
+                self.assertEqual(state, original)
 
     def test_monitoring_states_do_not_invent_live_prices(self):
         base = {

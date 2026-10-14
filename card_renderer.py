@@ -160,25 +160,17 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
              27, bold=True, width=113, align="center")
         text(x + 62, 731, f"+{percentages[i]}%", 23, green, True, 110, "center")
 
-    # Gamma is informational; absent values remain explicitly unavailable.
+    # Keep contract metrics only; Gamma has no visible section or placeholder.
     box((24, 783, 659, 940))
     line((342, 798, 342, 923))
-    text(46, 807, "DELTA", 14, muted)
+    text(46, 827, "DELTA", 14, muted)
     delta = state.get("delta")
-    text(46, 827, "N/A" if delta in (None, "") else f"{bot.safe_float(delta):+.2f}", 24, bold=True)
-    text(46, 879, "IMPLIED VOLATILITY", 14, muted)
+    text(46, 855, "N/A" if delta in (None, "") else f"{bot.safe_float(delta):+.2f}", 24, bold=True)
+    text(380, 827, "IMPLIED VOLATILITY", 14, muted)
     iv = state.get("iv")
     iv_value = bot.safe_float(iv)
-    text(46, 900, "N/A" if iv in (None, "") else f"{iv_value if iv_value > 3 else iv_value * 100:.1f}%",
+    text(380, 855, "N/A" if iv in (None, "") else f"{iv_value if iv_value > 3 else iv_value * 100:.1f}%",
          24, bold=True)
-    flip, gamma_status = gamma_values(state)
-    text(380, 807,
-         "GAMMA FILTER" if state.get("gamma_policy") == "disabled" else "MODELED GAMMA FLIP",
-         14, muted)
-    text(380, 827, flip if flip is not None else "N/A", 24, bold=True)
-    text(380, 879, "GAMMA STATUS", 14, muted)
-    text(380, 900, gamma_status if gamma_status else "UNAVAILABLE", 20,
-         bold=True, width=263)
 
     # The requested layout retains the quote time and a small strategy audit line.
     line((24, 959, 659, 959))

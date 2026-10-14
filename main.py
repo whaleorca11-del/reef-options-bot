@@ -4583,6 +4583,7 @@ class CanonicalHandler(bot.Handler):
                                             AUTO_SCAN_OPENING_INTERVAL_SECONDS
                                         ),
                                         "entry_signal_mode": _autonomous_entry_signal_mode(),
+                                        "card_gamma_section_visible": False,
                                         "macd_settings": {
                                             "entry_gate_enabled": False,
                                             "fast": 120, "slow": 180, "signal": 40,
