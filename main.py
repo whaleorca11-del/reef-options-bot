@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 import requests
 import macd_direction
+import paper_tradingview
 from card_renderer import CARD_STYLE
 from paper_entry_rules import RULES as PAPER_ENTRY_RULES
 from marketdata_quota import MarketDataQuota
@@ -31,7 +32,7 @@ bot.AUTO_SCAN_MIN_SCORE = 75.0
 # Gamma Flip is explicitly disabled as an entry gate and confidence vote.
 GAMMA_DIRECTION_GATE_ENABLED = False
 LIVE_ENTRY_ALERTS_ENABLED = False
-bot.ENTRY_SIGNAL_DESCRIPTION = "Live entry alerts PAUSED for paper validation; EMA9 daily / EMA200 5m / session VWAP crossing rules await a data source; Gamma Flip disabled"
+bot.ENTRY_SIGNAL_DESCRIPTION = "Live entry alerts PAUSED; TradingView paper-only EMA9 daily / EMA200 5m / session VWAP crossings; Gamma Flip disabled"
 
 
 def _autonomous_entry_signal_mode():
@@ -152,6 +153,21 @@ def trade_state_path():
     return Path(configured).expanduser() if configured else Path(bot.__file__).with_name(
         "reef_trade_state.json"
     )
+
+
+_PAPER_RECORDER = paper_tradingview.PaperRecorder(
+    trade_state_path().with_name("orca_paper_signals.json")
+)
+
+
+def _paper_session_bounds(now):
+    """Reuse ORCA's exchange holidays and early closes, including the final bar."""
+    local = now.astimezone(bot.NEW_YORK_TZ)
+    opening = local.replace(hour=9, minute=30, second=0, microsecond=0)
+    if not bot.market_is_open_now(opening):
+        return None
+    close_hour = 13 if local.date() in bot._market_early_closes(local.year) else 16
+    return opening, local.replace(hour=close_hour, minute=0, second=0, microsecond=0)
 
 
 def _load_durable_trade_store():
@@ -4470,7 +4486,7 @@ def start_auto_monitor():
 
 def start_auto_scanner():
     if not LIVE_ENTRY_ALERTS_ENABLED:
-        print("Live entry scanner paused for paper validation; awaiting data source")
+        print("Live entry scanner paused; paper observations use TradingView /paper-signal")
         return None
     if not bot.AUTO_SCAN_ENABLED:
         return None
@@ -4489,6 +4505,18 @@ class CanonicalHandler(bot.Handler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/paper-results":
+            self.json_response(200, _PAPER_RECORDER.snapshot(bot.now_new_york()))
+            return
+        if path == "/paper-script":
+            script = Path(__file__).with_name("ORCA_PAPER_EMA_VWAP_5M.pine").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="ORCA_PAPER_EMA_VWAP_5M.pine"')
+            self.send_header("Content-Length", str(len(script)))
+            self.end_headers()
+            self.wfile.write(script)
+            return
         if path not in ("/health", "/performance"):
             return super().do_GET()
         monitored = []
@@ -4603,7 +4631,7 @@ class CanonicalHandler(bot.Handler):
                                         "card_style": CARD_STYLE,
                                         "live_entry_alerts_enabled": LIVE_ENTRY_ALERTS_ENABLED,
                                         "paper_entry": {
-                                            "status": "awaiting_data_source",
+                                            **_PAPER_RECORDER.snapshot(bot.now_new_york()),
                                             "rules": PAPER_ENTRY_RULES,
                                         },
                                         "macd_settings": {
@@ -4632,6 +4660,44 @@ class CanonicalHandler(bot.Handler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/paper-signal":
+            secret = bot.env("REEF_WEBHOOK_SECRET")
+            if not secret:
+                self.json_response(503, {"error": "webhook authentication is not configured"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 16384:
+                    raise ValueError("bounded JSON object required")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON object required")
+            except (ValueError, UnicodeDecodeError):
+                self.json_response(400, {"error": "valid bounded JSON object required"})
+                return
+            if not hmac.compare_digest(
+                str(payload.get("secret", "")).encode("utf-8"), secret.encode("utf-8")
+            ):
+                self.json_response(401, {"error": "invalid secret"})
+                return
+            try:
+                now = bot.now_new_york()
+                candle = paper_tradingview.from_webhook(
+                    payload, now, bot.WATCHLIST, bot.EXCLUDED_SYMBOLS,
+                    _paper_session_bounds,
+                )
+                result = _PAPER_RECORDER.record(candle, now)
+            except paper_tradingview.PaperConflictError as error:
+                self.json_response(409, {"error": str(error)})
+                return
+            except paper_tradingview.PaperDataError as error:
+                self.json_response(400, {"error": str(error)})
+                return
+            except (RuntimeError, OSError):
+                self.json_response(503, {"error": "paper storage unavailable; observation not saved"})
+                return
+            self.json_response(200, result)
+            return
         if path == "/macd-signal":
             secret = bot.env("REEF_WEBHOOK_SECRET")
             if not secret:
