@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 import requests
 import macd_direction
 import paper_tradingview
+import paper_options
 from card_renderer import CARD_STYLE
 from paper_entry_rules import RULES as PAPER_ENTRY_RULES
 from marketdata_quota import MarketDataQuota
@@ -4500,13 +4501,92 @@ def _thread_status(kind):
     return bool(thread and thread.is_alive())
 
 
+def _paper_select_contract(row, paper_tickers):
+    """Choose on the observed side only, without live-store writes or indicators."""
+    symbol, direction = row["symbol"], row["direction"]
+    if symbol not in bot.WATCHLIST or symbol in bot.EXCLUDED_SYMBOLS:
+        raise paper_options.PaperOptionUnavailable("SYMBOL_NOT_ALLOWED")
+    if _provider_is_marketdata() and _marketdata_account_credit_limit_reason():
+        raise paper_options.PaperOptionUnavailable("MARKETDATA_ACCOUNT_CREDIT_LIMIT")
+    with bot.TRADE_STATE_LOCK:
+        live_tickers = _existing_contract_tickers(bot._load_trade_store(), symbol)
+    raw = massive_chain(symbol, direction)  # Historical name; permitted provider dispatch only.
+    candidates, _ = _prepare_side(raw, row["stock_close"])
+    candidates = _exclude_recorded_contracts(candidates, set(paper_tickers) | live_tickers)
+    diagnostics = {
+        "candidate_count": len(getattr(candidates, "all_candidates", [])),
+        "eligible_count": len(candidates),
+        "rejection_reasons": sorted({reason for c in getattr(candidates, "all_candidates", [])
+                                     for reason in c.get("rejection_reasons", [])}),
+    }
+    if not candidates:
+        return {"contract": None, "reason": "NO_ELIGIBLE_UNSENT_CONTRACT",
+                "diagnostics": diagnostics}
+    # One fresh exact-contract request, not an unbounded series of retries.
+    try:
+        fresh = refresh_contract_quote_for_entry(symbol, candidates[0], row["stock_close"])
+    except RuntimeError as error:
+        if str(error).startswith("WAIT - "):
+            raise paper_options.PaperOptionUnavailable(str(error)) from error
+        raise
+    try:
+        json.dumps(fresh, allow_nan=False)
+    except (ValueError, TypeError) as error:
+        raise paper_options.PaperOptionUnavailable("NON_FINITE_OPTION_DATA") from error
+    if fresh.get("iv") is None:
+        return {"contract": None, "reason": "IV_UNAVAILABLE", "diagnostics": diagnostics}
+    quality = _macd_contract_assessment(
+        direction, fresh, None, row["stock_close"], _scan_mode_context()["required_score"]
+    )
+    if not quality["can_open"]:
+        diagnostics["quality_rejections"] = quality["wait_reasons"]
+        return {"contract": None, "reason": quality["wait_status"], "diagnostics": diagnostics}
+    return {"contract": fresh, "diagnostics": diagnostics}
+
+
+def _paper_option_quote(symbol, contract, stock_price):
+    raw = _snapshot_data(provider_contract_snapshot(symbol, contract["ticker"]))
+    return normalize_contract(raw, stock_price)
+
+
+_PAPER_OPTIONS = paper_options.PaperOptionEngine(
+    trade_state_path().with_name("orca_paper_options.json"),
+    select=_paper_select_contract, quote=_paper_option_quote,
+    clock=lambda: bot.now_new_york(), session_bounds=_paper_session_bounds,
+    max_quote_age=QUOTE_FRESH_SECONDS,
+)
+
+
+def _paper_snapshot(now):
+    stock = _PAPER_RECORDER.snapshot(now)
+    options = _PAPER_OPTIONS.snapshot(now)
+    lookup = {row["id"]: row for row in options.get("recent_records", [])}
+    recent = []
+    for signal in stock.get("recent_signals", []):
+        key = f'{signal["signal_type"]}:{signal["symbol"]}:{signal["bar_close_time_ms"]}'
+        row = lookup.get(key)
+        recent.append({**signal, **({
+            "contract_status": row["status"], "paper_option_contract": row["contract"],
+            "option_profitability": row["outcomes"].get("60"),
+        } if row else {})})
+    return {
+        **stock, "recent_signals": recent, "contract_selection_enabled": True,
+        "paper_options": options,
+        "allowed_symbols": [s for s in bot.WATCHLIST if s not in bot.EXCLUDED_SYMBOLS],
+        "requires_tradingview_alert_for_each_symbol": True,
+    }
+
+
 class CanonicalHandler(bot.Handler):
     """Secure the canonical /scan-now route before invoking the scanner."""
 
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/paper-results":
-            self.json_response(200, _PAPER_RECORDER.snapshot(bot.now_new_york()))
+            self.json_response(200, _paper_snapshot(bot.now_new_york()))
+            return
+        if path == "/paper-option-results":
+            self.json_response(200, _PAPER_OPTIONS.snapshot(bot.now_new_york()))
             return
         if path == "/paper-script":
             script = Path(__file__).with_name("ORCA_PAPER_TENKAN_VWAP_30M.pine").read_bytes()
@@ -4631,7 +4711,7 @@ class CanonicalHandler(bot.Handler):
                                         "card_style": CARD_STYLE,
                                         "live_entry_alerts_enabled": LIVE_ENTRY_ALERTS_ENABLED,
                                         "paper_entry": {
-                                            **_PAPER_RECORDER.snapshot(bot.now_new_york()),
+                                            **_paper_snapshot(bot.now_new_york()),
                                             "rules": PAPER_ENTRY_RULES,
                                         },
                                         "macd_settings": {
@@ -4687,6 +4767,7 @@ class CanonicalHandler(bot.Handler):
                     _paper_session_bounds,
                 )
                 result = _PAPER_RECORDER.record(candle, now)
+                result["paper_option_evaluation"] = _PAPER_OPTIONS.submit(candle, now)
             except paper_tradingview.PaperConflictError as error:
                 self.json_response(409, {"error": str(error)})
                 return
@@ -4694,7 +4775,7 @@ class CanonicalHandler(bot.Handler):
                 self.json_response(400, {"error": str(error)})
                 return
             except (RuntimeError, OSError):
-                self.json_response(503, {"error": "paper storage unavailable; observation not saved"})
+                self.json_response(503, {"error": "paper storage unavailable; retry the same observation"})
                 return
             self.json_response(200, result)
             return
@@ -4901,6 +4982,7 @@ def main():
     except TradeStateCorruptionError as error:
         print("FATAL durable trade-state recovery error:", error)
         return
+    _PAPER_OPTIONS.start()
     bot.main()
 
 

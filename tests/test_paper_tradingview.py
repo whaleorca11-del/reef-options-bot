@@ -229,6 +229,11 @@ class PaperHttpTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as temp,
             patch.object(app, "_PAPER_RECORDER", paper.PaperRecorder(Path(temp) / "paper.json")),
+            patch.object(app, "_PAPER_OPTIONS", app.paper_options.PaperOptionEngine(
+                Path(temp) / "options.json", select=app._paper_select_contract,
+                quote=app._paper_option_quote, clock=lambda: NOW,
+                session_bounds=app._paper_session_bounds,
+            )),
             patch.object(app.bot, "env", return_value="test-only-secret") as secret,
             patch.object(app.bot, "now_new_york", return_value=NOW),
             patch.object(app.bot, "WATCHLIST", ["AAPL"]),
@@ -260,7 +265,12 @@ class PaperHttpTests(unittest.TestCase):
                 secret.return_value = ""
                 self.assertEqual(send(payload())[0], 503)
                 with urlopen(base + "/paper-results") as response:
-                    self.assertEqual(json.load(response)["signal_count"], 1)
+                    results = json.load(response)
+                    self.assertEqual(results["signal_count"], 1)
+                    self.assertEqual(results["paper_options"]["status_counts"], {"QUEUED": 1})
+                    self.assertEqual(results["recent_signals"][0]["contract_status"], "QUEUED")
+                with urlopen(base + "/paper-option-results") as response:
+                    self.assertEqual(json.load(response)["total_signals"], 1)
                 with urlopen(base + "/paper-script") as response:
                     self.assertIn(paper.SIGNAL_TYPE, response.read().decode())
                 trade.assert_not_called()
