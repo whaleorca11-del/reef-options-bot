@@ -26,7 +26,17 @@ import orca_whale_options_bot_FAST_60S_5S as bot
 
 # Canonical production scanner threshold for this entry point.
 bot.AUTO_SCAN_MIN_SCORE = 75.0
-bot.ENTRY_SIGNAL_DESCRIPTION = "Autonomous ORCA contract score, Gamma and directional flow -> fresh option quote -> Telegram; no MACD/EMA200 entry gate"
+# Gamma Flip is explicitly disabled as an entry gate and confidence vote.
+GAMMA_DIRECTION_GATE_ENABLED = False
+bot.ENTRY_SIGNAL_DESCRIPTION = "Autonomous ORCA contract score and relative option activity -> fresh option quote -> Telegram; Gamma Flip disabled; no MACD/EMA200 entry gate"
+
+
+def _autonomous_entry_signal_mode():
+    return "ORCA_SCORE_GAMMA" if GAMMA_DIRECTION_GATE_ENABLED else "ORCA_SCORE_FLOW"
+
+
+def _gamma_entry_policy():
+    return "directional_quality" if GAMMA_DIRECTION_GATE_ENABLED else "disabled"
 
 
 REQUESTED_DATA_PROVIDER = os.getenv("DATA_PROVIDER", "").strip().lower()
@@ -890,6 +900,14 @@ def calculate_trade_confidence(contract, direction_edge, gamma_state, entry_sour
         "entry_price_quality": round(entry_quality * 0.07, 2),
         "spread_availability": round(spread_quality * 0.03, 2),
     }
+    if not GAMMA_DIRECTION_GATE_ENABLED:
+        # Remove the Gamma vote entirely, rather than inventing confirmation
+        # or penalizing a deliberately disabled indicator as missing evidence.
+        components.pop("gamma_state")
+        components = {
+            name: round(points / 0.90, 2)
+            for name, points in components.items()
+        }
     value = round(max(0.0, min(100.0, sum(components.values()))), 1)
     return {
         "score": value,
@@ -1653,6 +1671,8 @@ def _card_fitted_font(draw, text, maximum_size, maximum_width, minimum_size=16, 
 
 def _card_gamma_values(state):
     """Format a usable modeled Gamma Flip; omit unavailable results."""
+    if state.get("gamma_policy") == "disabled":
+        return "OFF", "DISABLED"
     raw_status = str(
         state.get("gamma_status") or state.get("gamma_regime") or "INSUFFICIENT DATA"
     ).strip().upper()
@@ -2981,6 +3001,8 @@ def calculate_gamma_flip(call_raw, put_raw, stock_price, now=None):
 
 def gamma_direction_state(direction, stock_price, gamma_info):
     """Return confirmed/opposed/unavailable without rejecting unavailable data."""
+    if not GAMMA_DIRECTION_GATE_ENABLED:
+        return "disabled"
     if not bot.GAMMA_FLIP_ENABLED or not gamma_info:
         return "unavailable"
     if gamma_info.get("status") != "FOUND":
@@ -3105,7 +3127,11 @@ def create_trade(
         call_raw = massive_chain(symbol, "CALL")
         put_raw = massive_chain(symbol, "PUT")
         if gamma_info is None:
-            gamma_info = calculate_gamma_flip(call_raw, put_raw, stock_price)
+            gamma_info = (
+                calculate_gamma_flip(call_raw, put_raw, stock_price)
+                if GAMMA_DIRECTION_GATE_ENABLED
+                else {"status": "DISABLED", "regime": "DISABLED"}
+            )
         calls, _ = _prepare_side(call_raw, stock_price)
         puts, _ = _prepare_side(put_raw, stock_price)
         with bot.TRADE_STATE_LOCK:
@@ -3208,9 +3234,9 @@ def create_trade(
             "scan_mode": scan_mode,
             "required_score": required_score,
             "required_edge": required_edge,
-            "entry_signal_type": "ORCA_SCORE_GAMMA",
+            "entry_signal_type": _autonomous_entry_signal_mode(),
             "entry_signal_bar_time_ms": None,
-            "gamma_policy": "directional_quality",
+            "gamma_policy": _gamma_entry_policy(),
             "gamma_direction_state": gamma_direction or gamma_direction_state(
                 direction, stock_price, gamma_info
             ),
@@ -3549,7 +3575,7 @@ def _side_diagnostic(
             "score": score_ok,
             "directional_edge": edge_ok,
             "volume": volume_ok,
-            "gamma_flip": gamma_ok,
+            "gamma_flip": gamma_ok if GAMMA_DIRECTION_GATE_ENABLED else None,
         },
         "reason": "qualified" if accepted else "; ".join(reasons),
     }
@@ -3571,7 +3597,7 @@ def _marketdata_blocked_symbol_result(symbol, reason):
 
 
 def scan_symbol_options(symbol):
-    """Evaluate CALL and PUT independently using the pre-MACD ORCA policy."""
+    """Evaluate both sides without a Gamma Flip veto or MACD entry gate."""
     symbol = str(symbol or "").upper().strip()
     if symbol in bot.EXCLUDED_SYMBOLS:
         return {
@@ -3625,7 +3651,11 @@ def scan_symbol_options(symbol):
             "ignored": "underlying price unavailable",
         }
 
-    gamma_info = bot.calculate_gamma_flip(call_raw, put_raw, stock_price)
+    gamma_info = (
+        bot.calculate_gamma_flip(call_raw, put_raw, stock_price)
+        if GAMMA_DIRECTION_GATE_ENABLED
+        else {"status": "DISABLED", "regime": "DISABLED"}
+    )
 
     calls, call_exp = bot._prepare_side(call_raw, stock_price)
     puts, put_exp = bot._prepare_side(put_raw, stock_price)
@@ -3691,8 +3721,8 @@ def scan_symbol_options(symbol):
     result = {
         "symbol": symbol,
         "accepted": True,
-        "entry_signal_mode": "ORCA_SCORE_GAMMA",
-        "gamma_policy": "directional_quality",
+        "entry_signal_mode": _autonomous_entry_signal_mode(),
+        "gamma_policy": _gamma_entry_policy(),
         "scan_mode": scan_context["scan_mode"],
         "required_score": scan_context["required_score"],
         "required_edge": scan_context["required_edge"],
@@ -4498,7 +4528,7 @@ class CanonicalHandler(bot.Handler):
                                   "conservative_mode": ORCA_CONSERVATIVE_MODE,
                                   "conservative_min_score": ORCA_CONSERVATIVE_MIN_SCORE,
                                   "minimum_direction_edge": ORCA_MIN_DIRECTION_EDGE,
-                                  "gamma_direction_gate_enabled": True,
+                                  "gamma_direction_gate_enabled": GAMMA_DIRECTION_GATE_ENABLED,
                                   "macd_entry_gate_enabled": False,
                                   "data_feed_mode": "delayed/non-paid compatible; not claimed real-time",
                                   "last_scan_decisions": dict(_LAST_SCAN_DECISIONS),
@@ -4552,7 +4582,7 @@ class CanonicalHandler(bot.Handler):
                                         "auto_scan_opening_interval_seconds": (
                                             AUTO_SCAN_OPENING_INTERVAL_SECONDS
                                         ),
-                                        "entry_signal_mode": "ORCA_SCORE_GAMMA",
+                                        "entry_signal_mode": _autonomous_entry_signal_mode(),
                                         "macd_settings": {
                                             "entry_gate_enabled": False,
                                             "fast": 120, "slow": 180, "signal": 40,
@@ -4561,7 +4591,7 @@ class CanonicalHandler(bot.Handler):
                                              "price_rule": "above_for_call_below_for_put",
                                              "new_cross_required": False,
                                             "closed_candles_only": True,
-                                            "gamma_policy": "directional_quality",
+                                            "gamma_policy": _gamma_entry_policy(),
                                             "source": "TradingView /macd-signal",
                                         },
                                         "ichimoku_entry_gate_enabled": False,
@@ -4637,7 +4667,7 @@ class CanonicalHandler(bot.Handler):
                 "accepted": False,
                 "error": (
                     "Entry webhooks are disabled; ORCA qualifies contracts "
-                    "using contract quality, Gamma and directional flow."
+                    "using contract quality and relative option activity; Gamma Flip is disabled."
                 ),
             })
             return
@@ -4688,7 +4718,7 @@ class CanonicalHandler(bot.Handler):
                     self.json_response(410, {
                         "error": (
                             "entry webhooks are disabled; ORCA selects contracts "
-                            "using contract quality, Gamma and directional flow"
+                            "using contract quality and relative option activity; Gamma Flip is disabled"
                         ),
                         "signal_type": signal_type or None,
                         "ticker": payload.get("ticker"),

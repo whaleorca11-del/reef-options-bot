@@ -172,7 +172,9 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
     text(46, 900, "N/A" if iv in (None, "") else f"{iv_value if iv_value > 3 else iv_value * 100:.1f}%",
          24, bold=True)
     flip, gamma_status = gamma_values(state)
-    text(380, 807, "MODELED GAMMA FLIP", 14, muted)
+    text(380, 807,
+         "GAMMA FILTER" if state.get("gamma_policy") == "disabled" else "MODELED GAMMA FLIP",
+         14, muted)
     text(380, 827, flip if flip is not None else "N/A", 24, bold=True)
     text(380, 879, "GAMMA STATUS", 14, muted)
     text(380, 900, gamma_status if gamma_status else "UNAVAILABLE", 20,

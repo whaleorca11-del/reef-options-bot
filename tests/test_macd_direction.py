@@ -93,8 +93,10 @@ class MacdMathTests(unittest.TestCase):
 
 
 class AutonomousEntryTests(unittest.TestCase):
+    """Compatibility coverage explicitly opts into the former Gamma gate."""
     def setUp(self):
         self.patches = [
+            patch.object(app, "GAMMA_DIRECTION_GATE_ENABLED", True),
             patch.object(bot, "now_new_york", return_value=NOW),
             patch.object(app.time, "time", return_value=NOW.timestamp()),
             patch.object(app, "OPTION_ENTRY_MIN_PREMIUM", 2.5),
@@ -234,6 +236,109 @@ def webhook_payload():
     }
 
 
+class GammaDisabledEntryTests(unittest.TestCase):
+    def setUp(self):
+        AutonomousEntryTests.setUp(self)
+        gate = patch.object(app, "GAMMA_DIRECTION_GATE_ENABLED", False)
+        gate.start()
+        self.addCleanup(gate.stop)
+
+    def test_call_can_qualify_below_old_flip(self):
+        result, create = AutonomousEntryTests.scan(
+            self, "CALL", strengths=(100, 0), gamma_flip=220,
+        )
+        self.assertEqual(result["direction"], "CALL")
+        self.assertEqual(result["gamma_policy"], "disabled")
+        self.assertEqual(result["entry_signal_mode"], "ORCA_SCORE_FLOW")
+        self.assertEqual(result["call"]["gamma_direction_state"], "disabled")
+        self.assertIsNone(result["call"]["checks"]["gamma_flip"])
+        create.assert_called_once()
+
+    def test_put_can_qualify_above_old_flip(self):
+        result, create = AutonomousEntryTests.scan(
+            self, "PUT", strengths=(0, 100), gamma_flip=180,
+        )
+        self.assertEqual(result["direction"], "PUT")
+        self.assertEqual(create.call_args.args[1], "PUT")
+        self.assertEqual(result["put"]["gamma_direction_state"], "disabled")
+
+    def test_gamma_calculation_is_not_required(self):
+        result, create = AutonomousEntryTests.scan(
+            self, "PUT", strengths=(0, 100), gamma_failure=True,
+        )
+        self.assertEqual(result["status"], "TRADE")
+        self.assertIsNone(result["gamma_flip"])
+        create.assert_called_once()
+
+    def test_unclear_flow_and_bad_contracts_still_cannot_enter(self):
+        result, create = AutonomousEntryTests.scan(
+            self, "PUT", strengths=(100, 100),
+        )
+        self.assertEqual(result["status"], "WAIT - DIRECTION UNCLEAR")
+        create.assert_not_called()
+        result, create = AutonomousEntryTests.scan(
+            self, "PUT", strengths=(0, 100), bad=True,
+        )
+        self.assertNotEqual(result["status"], "TRADE")
+        create.assert_not_called()
+
+    def test_gamma_has_no_confidence_vote_or_missing_data_penalty(self):
+        contracts, _ = app._prepare_side([raw("PUT")], 200)
+        contract = contracts[0]
+        scores = []
+        for gamma_state in ("confirmed", "opposed", "unavailable", "disabled"):
+            confidence = app.calculate_trade_confidence(
+                contract, 100, gamma_state, "Fresh Bid/Ask Midpoint",
+            )
+            self.assertNotIn("gamma_state", confidence["components"])
+            self.assertEqual(confidence["level"], "HIGH")
+            scores.append(confidence["score"])
+        self.assertEqual(len(set(scores)), 1)
+        for gamma in ({}, {"status": "FOUND", "flip": 180},
+                      {"status": "FOUND", "flip": 220}):
+            assessment = app._conservative_assessment("PUT", contract, 100, gamma, 200)
+            self.assertTrue(assessment["can_open"])
+            self.assertEqual(assessment["gamma_direction_state"], "disabled")
+        contract["quote_fresh"] = False
+        assessment = app._conservative_assessment("PUT", contract, 100, {}, 200)
+        self.assertFalse(assessment["can_open"])
+        self.assertIn("WAIT - LIVE OPTION PRICE REQUIRED", assessment["wait_reasons"])
+
+    def test_direct_entry_does_not_reintroduce_gamma_or_macd(self):
+        contracts, _ = app._prepare_side([raw("PUT")], 200)
+        contract = contracts[0]
+        store = {"trades": {}}
+        with (
+            patch.object(app, "_fetch_macd_1h_direction",
+                         side_effect=AssertionError("MACD was not authorized")),
+            patch.object(bot, "_load_trade_store", side_effect=lambda: store),
+            patch.object(bot, "_save_trade_store"),
+            patch.object(app, "refresh_contract_quote_for_entry",
+                         return_value=copy.deepcopy(contract)) as quote,
+            patch.object(app, "_paper_trade_record", return_value={"id": "test"}),
+            patch.object(bot, "telegram_send_card", return_value=42) as send,
+        ):
+            trade = app.create_trade(
+                "AAPL", "PUT", 200, contract=contract,
+                gamma_info={"status": "FOUND", "flip": 180},
+                directional_edge=100,
+            )
+        self.assertEqual(trade["gamma_policy"], "disabled")
+        self.assertEqual(trade["gamma_direction_state"], "disabled")
+        self.assertEqual(trade["entry_signal_type"], "ORCA_SCORE_FLOW")
+        quote.assert_called_once()
+        send.assert_called_once()
+
+    def test_card_does_not_present_disabled_gamma_as_confirmation(self):
+        self.assertEqual(
+            app._card_gamma_values({
+                "gamma_policy": "disabled", "gamma_status": "FOUND",
+                "gamma_flip": 180, "stock_price": 200, "gamma_regime": "POSITIVE",
+            }),
+            ("OFF", "DISABLED"),
+        )
+
+
 class TradingViewMacdTests(unittest.TestCase):
     def test_all_price_positions_and_histogram_signs_without_a_cross(self):
         for hist, price, expected in (
@@ -355,7 +460,8 @@ class TradingViewMacdTests(unittest.TestCase):
                 with urlopen(f"http://127.0.0.1:{server.server_port}/health") as health:
                     health_payload = json.load(health)
                     self.assertFalse(health_payload["macd_entry_gate_enabled"])
-                    self.assertEqual(health_payload["configuration"]["entry_signal_mode"], "ORCA_SCORE_GAMMA")
+                    self.assertEqual(health_payload["configuration"]["entry_signal_mode"], "ORCA_SCORE_FLOW")
+                    self.assertFalse(health_payload["gamma_direction_gate_enabled"])
                     snapshot = health_payload["tradingview_signals"]["AAPL"]
                     self.assertTrue(snapshot["fresh"])
                     self.assertIn("received_at", snapshot)

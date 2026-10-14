@@ -301,7 +301,7 @@ class ThirtyMinuteIchimokuGateTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "TRADE")
         self.assertEqual(result["direction"], "CALL")
-        self.assertEqual(result["entry_signal_mode"], "ORCA_SCORE_GAMMA")
+        self.assertEqual(result["entry_signal_mode"], "ORCA_SCORE_FLOW")
         create_trade.assert_called_once()
 
     def test_create_trade_does_not_require_ichimoku_signal(self):
@@ -363,7 +363,7 @@ class ThirtyMinuteIchimokuGateTests(unittest.TestCase):
             )
 
         self.assertEqual(trade["status"], "active")
-        self.assertEqual(trade["entry_signal_type"], "ORCA_SCORE_GAMMA")
+        self.assertEqual(trade["entry_signal_type"], "ORCA_SCORE_FLOW")
         self.assertEqual(trade["message_id"], 12)
 
 
