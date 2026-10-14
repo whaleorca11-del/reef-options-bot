@@ -32,7 +32,7 @@ bot.AUTO_SCAN_MIN_SCORE = 75.0
 # Gamma Flip is explicitly disabled as an entry gate and confidence vote.
 GAMMA_DIRECTION_GATE_ENABLED = False
 LIVE_ENTRY_ALERTS_ENABLED = False
-bot.ENTRY_SIGNAL_DESCRIPTION = "Live entry alerts PAUSED; TradingView paper-only EMA9 daily / EMA200 5m / session VWAP crossings; Gamma Flip disabled"
+bot.ENTRY_SIGNAL_DESCRIPTION = "Live entry alerts PAUSED; TradingView paper-only EMA9 5m / session VWAP crossings; EMA200 5m preference only; Gamma Flip disabled"
 
 
 def _autonomous_entry_signal_mode():

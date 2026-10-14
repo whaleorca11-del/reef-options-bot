@@ -8,11 +8,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from paper_entry_rules import crossing_signal
+from paper_entry_rules import RULES, crossing_signal
 
-SIGNAL_TYPE = "ORCA_PAPER_CROSS_V1"
+SIGNAL_TYPE = RULES["strategy_id"]
 NY = ZoneInfo("America/New_York")
-LEVELS = ("ema9_daily", "ema200_5m", "session_vwap")
+LEVELS = ("ema9_5m", "ema200_5m", "session_vwap")
 HORIZONS = (15, 30, 60)
 
 
@@ -55,8 +55,8 @@ def from_webhook(payload, now, watchlist, excluded, session_bounds):
         or payload.get("timeframe") != "5"
         or payload.get("bar_closed") is not True
         or payload.get("ema9_period") != 9
-        or payload.get("ema9_timeframe") != "1D"
-        or payload.get("ema9_basis") != "previous_closed_daily"
+        or payload.get("ema9_timeframe") != "5"
+        or payload.get("ema9_basis") != "closed_5m"
         or payload.get("ema200_period") != 200
         or payload.get("ema200_timeframe") != "5"
         or payload.get("vwap_anchor") != "US_REGULAR_SESSION"
@@ -181,7 +181,7 @@ class PaperRecorder:
             # Heartbeats measure stock movement, not option P/L. Missing horizons
             # remain explicitly missing; never forward-fill an absent observation.
             for row in state["signals"]:
-                if row["symbol"] != symbol:
+                if row["symbol"] != symbol or row.get("signal_type") != SIGNAL_TYPE:
                     continue
                 elapsed = (end - row["bar_close_time_ms"]) / 60000
                 for minutes in HORIZONS:
@@ -216,7 +216,9 @@ class PaperRecorder:
                 state = self._read()
             except RuntimeError as error:
                 return {"source": "tradingview", "status": "storage_error", "error": str(error)}
-        latest = state["latest"]
+        latest = {symbol: row for symbol, row in state["latest"].items()
+                  if row.get("signal_type") == SIGNAL_TYPE}
+        signals = [row for row in state["signals"] if row.get("signal_type") == SIGNAL_TYPE]
         fresh = {
             symbol: 0 <= now.timestamp() - row["bar_close_time_ms"] / 1000 <= 420
             for symbol, row in latest.items()
@@ -226,10 +228,13 @@ class PaperRecorder:
             "status": ("receiving" if any(fresh.values()) else
                        "waiting_for_fresh_candles" if latest else "awaiting_tradingview_alert"),
             "fresh_symbols": [symbol for symbol, is_fresh in fresh.items() if is_fresh],
-            "latest_candles": latest, "signal_count": len(state["signals"]),
-            "recent_signals": state["signals"][-10:],
+            "strategy_id": SIGNAL_TYPE,
+            "latest_candles": latest, "signal_count": len(signals),
+            "recent_signals": signals[-10:],
+            "legacy_signal_count": len(state["signals"]) - len(signals),
             "outcome_horizons_minutes": list(HORIZONS),
             "outcomes_measure": "stock_direction_only_not_option_profit",
             "contract_selection_enabled": False, "telegram_enabled": False,
-            "ema9_basis": "last completed regular-session daily candle",
+            "ema9_basis": "nine five-minute candles, confirmed at bar close",
+            "ema200_role": RULES["ema200_role"],
         }

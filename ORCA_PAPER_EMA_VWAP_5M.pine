@@ -1,5 +1,5 @@
 //@version=6
-indicator("ORCA Paper — Daily EMA9 / 5m EMA200 / Session VWAP", overlay=true)
+indicator("ORCA Paper — EMA9 / VWAP crossings + EMA200 preference", overlay=true)
 
 webhookSecret = input.text_area("", "سر الربط — REEF_WEBHOOK_SECRET", confirm=true, display=display.none)
 sendPaper = input.bool(false, "إرسال الشموع للاختبار الورقي فقط", confirm=true, display=display.none)
@@ -13,14 +13,13 @@ if syminfo.type != "stock" or syminfo.timezone != "America/New_York"
 if syminfo.session != session.regular
     runtime.error("اختر الجلسة العادية فقط، وأوقف الساعات الممتدة.")
 
-regularTicker = ticker.new(syminfo.prefix, syminfo.ticker, session.regular)
-// Previous completed daily EMA: deliberately stable throughout the session.
-ema9Daily = request.security(regularTicker, "1D", ta.ema(close, 9)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+// Both EMAs use this regular-session five-minute chart.
+ema9 = ta.ema(close, 9)
 ema200 = ta.ema(close, 200)
 sessionVwap = ta.vwap(hlc3, session.isfirstbar_regular)
 previousVwap = session.isfirstbar_regular ? na : sessionVwap[1]
 
-plot(ema9Daily, "EMA9 — آخر يوم مكتمل", color=color.orange, linewidth=2)
+plot(ema9, "EMA9 — 9 شموع خمس دقائق", color=color.orange, linewidth=2)
 plot(ema200, "EMA200 — 200 شمعة خمس دقائق", color=color.blue, linewidth=2)
 plot(sessionVwap, "VWAP — الجلسة العادية", color=color.purple, linewidth=2)
 
@@ -29,8 +28,8 @@ crossUp(float level, float before) =>
 crossDown(float level, float before) =>
     not na(level) and not na(before) and close[1] >= before and close < level
 
-up = crossUp(ema9Daily, ema9Daily[1]) or crossUp(ema200, ema200[1]) or crossUp(sessionVwap, previousVwap)
-down = crossDown(ema9Daily, ema9Daily[1]) or crossDown(ema200, ema200[1]) or crossDown(sessionVwap, previousVwap)
+up = crossUp(ema9, ema9[1]) or crossUp(sessionVwap, previousVwap)
+down = crossDown(ema9, ema9[1]) or crossDown(sessionVwap, previousVwap)
 callSignal = barstate.isconfirmed and session.ismarket and up and not down
 putSignal = barstate.isconfirmed and session.ismarket and down and not up
 plotshape(callSignal, title="CALL ورقي", text="CALL\nورقي", style=shape.labelup, location=location.belowbar, color=color.green, textcolor=color.white, size=size.tiny)
@@ -40,21 +39,23 @@ escapeJson(string value) =>
     str.replace_all(str.replace_all(str.replace_all(str.replace_all(value, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n"), "\r", "\\r")
 numberJson(float value) =>
     na(value) ? "null" : str.tostring(value, "#.############")
-levelsJson(float daily, float intraday, float vwap) =>
-    "{\"ema9_daily\":" + numberJson(daily) + ",\"ema200_5m\":" + numberJson(intraday) + ",\"session_vwap\":" + numberJson(vwap) + "}"
+levelsJson(float shortAverage, float longAverage, float vwap) =>
+    "{\"ema9_5m\":" + numberJson(shortAverage) + ",\"ema200_5m\":" + numberJson(longAverage) + ",\"session_vwap\":" + numberJson(vwap) + "}"
 
 secretReady = str.length(str.trim(webhookSecret)) > 0
-var table setupStatus = table.new(position.top_right, 1, 2)
+var table setupStatus = table.new(position.top_right, 1, 3)
 if barstate.islast
     status = not sendPaper ? "الإرسال الورقي معطّل" : not secretReady ? "السر فارغ — لن يتم الإرسال" : "جاهز محليًا — يلزم إنشاء تنبيه TradingView"
     table.cell(setupStatus, 0, 0, status, text_color=color.white, bgcolor=color.new(secretReady and sendPaper ? color.green : color.gray, 20))
     table.cell(setupStatus, 0, 1, "ورقي فقط — العلامات التاريخية ليست نتائج ربحية", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    contextText = na(ema200) ? "EMA200 غير متاح — لا يمنع الإشارة" : close > ema200 ? "فوق EMA200 — تفضيل CALL فقط، لا يمنع PUT" : close < ema200 ? "تحت EMA200 — تفضيل PUT فقط، لا يمنع CALL" : "السعر عند EMA200 — تفضيل محايد"
+    table.cell(setupStatus, 0, 2, contextText, text_color=color.white, bgcolor=color.new(color.blue, 35))
 
 varip int lastSentClose = na
 fresh = timenow >= time_close and timenow - time_close <= 120000
 hasPriorBar = not na(close[1]) and not na(time_close[1])
 if barstate.isrealtime and barstate.isconfirmed and session.ismarket and sendPaper and secretReady and fresh and hasPriorBar and (na(lastSentClose) or time_close != lastSentClose)
     // Every closed bar is required to measure subsequent stock movement.
-    body = "{\"secret\":\"" + escapeJson(webhookSecret) + "\",\"ticker\":\"" + syminfo.ticker + "\",\"signal_type\":\"ORCA_PAPER_CROSS_V1\",\"timeframe\":\"5\",\"bar_closed\":true,\"regular_session\":true,\"ema9_period\":9,\"ema9_timeframe\":\"1D\",\"ema9_basis\":\"previous_closed_daily\",\"ema200_period\":200,\"ema200_timeframe\":\"5\",\"vwap_anchor\":\"US_REGULAR_SESSION\",\"bar_time_ms\":" + str.tostring(time) + ",\"bar_close_time_ms\":" + str.tostring(time_close) + ",\"previous_bar_close_time_ms\":" + str.tostring(time_close[1]) + ",\"previous_close\":" + numberJson(close[1]) + ",\"close\":" + numberJson(close) + ",\"previous_levels\":" + levelsJson(ema9Daily[1], ema200[1], previousVwap) + ",\"levels\":" + levelsJson(ema9Daily, ema200, sessionVwap) + "}"
+    body = "{\"secret\":\"" + escapeJson(webhookSecret) + "\",\"ticker\":\"" + syminfo.ticker + "\",\"signal_type\":\"ORCA_PAPER_CROSS_V3\",\"timeframe\":\"5\",\"bar_closed\":true,\"regular_session\":true,\"ema9_period\":9,\"ema9_timeframe\":\"5\",\"ema9_basis\":\"closed_5m\",\"ema200_period\":200,\"ema200_timeframe\":\"5\",\"vwap_anchor\":\"US_REGULAR_SESSION\",\"bar_time_ms\":" + str.tostring(time) + ",\"bar_close_time_ms\":" + str.tostring(time_close) + ",\"previous_bar_close_time_ms\":" + str.tostring(time_close[1]) + ",\"previous_close\":" + numberJson(close[1]) + ",\"close\":" + numberJson(close) + ",\"previous_levels\":" + levelsJson(ema9[1], ema200[1], previousVwap) + ",\"levels\":" + levelsJson(ema9, ema200, sessionVwap) + "}"
     alert(body, alert.freq_once_per_bar_close)
     lastSentClose := time_close

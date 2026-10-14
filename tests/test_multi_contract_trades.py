@@ -1,4 +1,5 @@
 import copy
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -44,6 +45,45 @@ class MultiContractTradeTests(unittest.TestCase):
         enabled = patch.object(app, "LIVE_ENTRY_ALERTS_ENABLED", True)
         enabled.start()
         self.addCleanup(enabled.stop)
+
+    def test_repeated_cross_after_disk_reload_never_resends_recorded_contract(self):
+        from paper_entry_rules import crossing_signal
+        ticker = "AAPL261022C00215000"
+        for status in ("active", "closed", "expired", "recovery_required", "opening"):
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(app, "trade_state_path", return_value=Path(directory) / "trades.json"),
+                patch.object(bot, "_load_trade_store", side_effect=app._load_durable_trade_store),
+                patch.object(bot, "_save_trade_store") as save,
+                patch.object(app, "refresh_contract_quote_for_entry") as quote,
+                patch.object(bot, "telegram_send_card") as send,
+            ):
+                stored = {"trades": {"AAPL": {
+                    "symbol": "AAPL", "contract_ticker": ticker,
+                    "direction": "CALL", "status": status, "message_id": 42,
+                }}}
+                app._save_durable_trade_store(stored)
+                original = app.trade_state_path().read_bytes()
+                # Breaks and re-crosses are real direction observations, but the
+                # saved exact option ticker must not produce a second card.
+                for previous, close, direction in ((99, 101, "CALL"),
+                                                    (101, 99, "PUT"),
+                                                    (99, 101, "CALL")):
+                    result = crossing_signal(previous, close, {"ema9_5m": 100},
+                                             {"ema9_5m": 100}, bar_closed=True)
+                    self.assertEqual(result["direction"], direction)
+                    if direction == "CALL":
+                        duplicate = app.create_trade(
+                            "AAPL", direction, close,
+                            contract=option(f"O:{ticker}"),
+                        )
+                        self.assertTrue(duplicate["_ignored_duplicate"])
+                        self.assertEqual(duplicate["message_id"], 42)
+                self.assertEqual(app.trade_state_path().read_bytes(), original)
+                send.assert_not_called()
+                quote.assert_not_called()
+                save.assert_not_called()
 
     def test_distinct_contract_coexists_and_same_contract_is_not_resent(self):
         old_trade = {

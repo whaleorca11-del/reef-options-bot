@@ -21,16 +21,16 @@ def payload(now=NOW):
     return {
         "secret": "test-only-secret", "ticker": "NASDAQ:AAPL",
         "signal_type": paper.SIGNAL_TYPE, "timeframe": "5", "bar_closed": True,
-        "regular_session": True, "ema9_period": 9, "ema9_timeframe": "1D",
-        "ema9_basis": "previous_closed_daily",
+        "regular_session": True, "ema9_period": 9, "ema9_timeframe": "5",
+        "ema9_basis": "closed_5m",
         "ema200_period": 200, "ema200_timeframe": "5",
         "vwap_anchor": "US_REGULAR_SESSION",
         "bar_time_ms": int(start.timestamp() * 1000),
         "bar_close_time_ms": int(end.timestamp() * 1000),
         "previous_bar_close_time_ms": int(start.timestamp() * 1000),
         "previous_close": 99, "close": 101,
-        "previous_levels": {"ema9_daily": 100, "ema200_5m": None, "session_vwap": None},
-        "levels": {"ema9_daily": 100, "ema200_5m": None, "session_vwap": None},
+        "previous_levels": {"ema9_5m": 100, "ema200_5m": None, "session_vwap": None},
+        "levels": {"ema9_5m": 100, "ema200_5m": None, "session_vwap": None},
     }
 
 
@@ -40,7 +40,7 @@ def parse(body, now=NOW):
 
 class PaperValidationTests(unittest.TestCase):
     def test_each_indicator_can_trigger_without_other_gates(self):
-        for name in paper.LEVELS:
+        for name in ("ema9_5m", "session_vwap"):
             for before, close, expected in ((99, 101, "CALL"), (101, 99, "PUT")):
                 body = payload()
                 body.update(previous_close=before, close=close, direction="FAKE")
@@ -50,6 +50,25 @@ class PaperValidationTests(unittest.TestCase):
                 self.assertEqual(result["direction"], expected)
                 self.assertNotIn("secret", result)
 
+    def test_ema200_never_triggers_entry_or_vetoes_other_crosses(self):
+        body = payload()
+        body.update(previous_levels={"ema200_5m": 100}, levels={"ema200_5m": 100})
+        self.assertIsNone(parse(body)["direction"])
+        for direction, before, close in (("CALL", 99, 101), ("PUT", 101, 99)):
+            for average, expected in (
+                (90, "ALIGNED" if direction == "CALL" else "OPPOSED"),
+                (110, "OPPOSED" if direction == "CALL" else "ALIGNED"),
+                (close, "NEUTRAL"), (None, "UNAVAILABLE"),
+            ):
+                with self.subTest(direction=direction, average=average):
+                    body = payload()
+                    body.update(previous_close=before, close=close)
+                    body["levels"]["ema200_5m"] = average
+                    result = parse(body)
+                    self.assertEqual(result["direction"], direction)
+                    self.assertEqual(result["ema200_context"]["preference"], expected)
+                    self.assertFalse(result["ema200_context"]["entry_gate"])
+
     def test_conflict_open_missing_and_no_cross(self):
         body = payload()
         body["previous_levels"]["session_vwap"] = 98
@@ -57,7 +76,7 @@ class PaperValidationTests(unittest.TestCase):
         self.assertEqual(parse(body)["status"], "WAIT - CONFLICTING CROSSES")
         for levels, close, status in (
             ({}, 101, "WAIT - INDICATOR DATA"),
-            ({"ema9_daily": 100}, 99, "WAIT - NO CROSS"),
+            ({"ema9_5m": 100}, 99, "WAIT - NO CROSS"),
         ):
             body = payload()
             body.update(levels=levels, previous_levels=levels, close=close)
@@ -67,14 +86,16 @@ class PaperValidationTests(unittest.TestCase):
 
     def test_exact_rules_timestamps_and_numbers_are_required(self):
         bad = [
-            {"ticker": "MSTR"}, {"timeframe": "60"}, {"ema9_timeframe": "5"},
-            {"ema9_basis": "developing_daily"}, {"ema200_period": 2000},
+            {"ticker": "MSTR"}, {"timeframe": "60"}, {"ema9_timeframe": "1D"},
+            {"ema9_basis": "previous_closed_daily"}, {"ema200_period": 2000},
             {"signal_type": "MACD_1H_EMA200"}, {"regular_session": False},
+            {"signal_type": "ORCA_PAPER_CROSS_V1"},
+            {"signal_type": "ORCA_PAPER_CROSS_V2"},
             {"vwap_anchor": "WEEK"}, {"close": True}, {"close": float("nan")},
             {"close": 0}, {"previous_close": float("inf")},
             {"bar_time_ms": True}, {"bar_close_time_ms": payload()["bar_close_time_ms"] + 1000},
             {"previous_bar_close_time_ms": payload()["bar_time_ms"] - 300000},
-            {"previous_levels": []}, {"levels": {"ema9_daily": float("nan")}},
+            {"previous_levels": []}, {"levels": {"ema9_5m": float("nan")}},
         ]
         for changes in bad:
             with self.subTest(changes=changes), self.assertRaises(paper.PaperDataError):
@@ -165,6 +186,21 @@ class PaperStorageTests(unittest.TestCase):
         self.recorder.record(parse(payload()), NOW)
         self.assertEqual(self.recorder.snapshot(NOW + timedelta(minutes=10))["status"], "waiting_for_fresh_candles")
 
+    def test_preference_is_saved_and_legacy_strategy_is_not_mixed(self):
+        body = payload()
+        body["levels"]["ema200_5m"] = 110
+        self.recorder.record(parse(body), NOW)
+        current = self.recorder.snapshot(NOW)
+        self.assertEqual(current["recent_signals"][0]["ema200_context"]["preference"], "OPPOSED")
+        state = json.loads(self.recorder.path.read_text())
+        old = {**state["signals"][0], "signal_type": "ORCA_PAPER_CROSS_V1"}
+        state["signals"].append(old)
+        self.recorder.path.write_text(json.dumps(state))
+        results = self.recorder.snapshot(NOW)
+        self.assertEqual(results["signal_count"], 1)
+        self.assertEqual(results["legacy_signal_count"], 1)
+        self.assertEqual(len(json.loads(self.recorder.path.read_text())["signals"]), 2)
+
 
 class PaperHttpTests(unittest.TestCase):
     def test_http_auth_record_results_script_and_no_live_side_effects(self):
@@ -204,7 +240,7 @@ class PaperHttpTests(unittest.TestCase):
                 with urlopen(base + "/paper-results") as response:
                     self.assertEqual(json.load(response)["signal_count"], 1)
                 with urlopen(base + "/paper-script") as response:
-                    self.assertIn("ORCA_PAPER_CROSS_V1", response.read().decode())
+                    self.assertIn(paper.SIGNAL_TYPE, response.read().decode())
                 trade.assert_not_called()
                 chain.assert_not_called()
                 telegram.assert_not_called()
@@ -215,12 +251,12 @@ class PaperHttpTests(unittest.TestCase):
 
 
 class PaperPineContractTests(unittest.TestCase):
-    def test_script_has_mixed_timeframes_closed_bars_and_dynamic_authenticated_alerts(self):
+    def test_script_has_five_minute_emas_closed_bars_and_dynamic_authenticated_alerts(self):
         source = (Path(__file__).resolve().parents[1] / "ORCA_PAPER_EMA_VWAP_5M.pine").read_text()
         for text in (
             'timeframe.multiplier != 5', 'not chart.is_standard',
             'syminfo.session != session.regular',
-            'ta.ema(close, 9)[1]', 'lookahead=barmerge.lookahead_on',
+            'ema9 = ta.ema(close, 9)',
             'ta.ema(close, 200)', 'ta.vwap(hlc3, session.isfirstbar_regular)',
             'session.isfirstbar_regular ? na : sessionVwap[1]',
             'barstate.isrealtime and barstate.isconfirmed',
@@ -230,6 +266,12 @@ class PaperPineContractTests(unittest.TestCase):
             self.assertIn(text, source)
         self.assertNotIn("alertcondition(", source)
         self.assertNotIn("MACD", source)
+        self.assertNotIn("crossUp(ema200", source)
+        self.assertNotIn("crossDown(ema200", source)
+        self.assertIn(paper.SIGNAL_TYPE, source)
+        self.assertNotIn("request.security(", source)
+        self.assertNotIn("ema9_daily", source)
+        self.assertIn('crossUp(ema9, ema9[1])', source)
 
 
 if __name__ == "__main__":
