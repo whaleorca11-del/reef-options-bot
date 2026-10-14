@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 import requests
 import macd_direction
+from card_renderer import CARD_STYLE
 from marketdata_quota import MarketDataQuota
 from provider_config import PROVIDER_KEYS, REMOVED_PROVIDERS, resolve_data_provider
 
@@ -1719,7 +1720,7 @@ def _paste_card_logo(image, symbol, box):
             ),
             label,
             font=font,
-            fill=(242, 247, 250),
+            fill=(0, 19, 56),
         )
         return
 
@@ -4584,6 +4585,7 @@ class CanonicalHandler(bot.Handler):
                                         ),
                                         "entry_signal_mode": _autonomous_entry_signal_mode(),
                                         "card_gamma_section_visible": False,
+                                        "card_style": CARD_STYLE,
                                         "macd_settings": {
                                             "entry_gate_enabled": False,
                                             "fast": 120, "slow": 180, "signal": 40,

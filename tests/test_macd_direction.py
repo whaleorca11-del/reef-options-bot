@@ -463,6 +463,7 @@ class TradingViewMacdTests(unittest.TestCase):
                     self.assertEqual(health_payload["configuration"]["entry_signal_mode"], "ORCA_SCORE_FLOW")
                     self.assertFalse(health_payload["gamma_direction_gate_enabled"])
                     self.assertFalse(health_payload["configuration"]["card_gamma_section_visible"])
+                    self.assertEqual(health_payload["configuration"]["card_style"], "white_reference")
                     snapshot = health_payload["tradingview_signals"]["AAPL"]
                     self.assertTrue(snapshot["fresh"])
                     self.assertIn("received_at", snapshot)

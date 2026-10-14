@@ -28,15 +28,18 @@ class MacdCardDeliveryTests(unittest.TestCase):
         ):
             output = app.render_trade_card(state)
             with app.bot.Image.open(output) as image:
-                self.assertEqual(image.size, (1080, 1620))
+                self.assertEqual(image.size, (1080, 1270))
+                self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
             calls = {call.args[2]: call for call in text.call_args_list}
             self.assertIn("PUT ↘", calls)
             self.assertFalse(any("GAMMA" in label for label in calls))
             self.assertIn("N/A", calls)
             self.assertEqual(len({
-                calls[f"${target:.2f}"].args[1][1] for target in state["targets"]
+                calls[f"${target:.2f}"].args[1][1]
+                + calls[f"${target:.2f}"].kwargs["font"].getbbox(f"${target:.2f}")[1]
+                for target in state["targets"]
             }), 1)
-            self.assertEqual(calls["PUT ↘"].kwargs["fill"], "#FF596D")
+            self.assertEqual(calls["PUT ↘"].kwargs["fill"], "#FFFFFF")
             contract_calls = [
                 call for call in text.call_args_list
                 if call.args[2] == state["contract_ticker"]
@@ -80,6 +83,34 @@ class MacdCardDeliveryTests(unittest.TestCase):
                                  "$5.350", "$2.94", "$350.00"):
                     self.assertIn(expected, labels)
                 self.assertEqual(state, original)
+
+    def test_white_reference_keeps_direction_colors_and_original_state(self):
+        base = {
+            "symbol": "NVDA", "direction": "CALL", "status": "test",
+            "stock_price": 225.16, "expiration": "2026-10-23",
+            "contract_ticker": "NVDA261023C00225000", "strike": 225,
+            "entry_price": 5.2, "midpoint": 5.2, "bid": 5.15, "ask": 5.25,
+            "targets": [6.24, 7.54, 8.84, 10.4, 13], "stop_loss": 2.86,
+            "score": 90.5, "delta": 0.52, "iv": 0.333,
+        }
+        for symbol in ("NVDA", "AAPL", "GOOGL"):
+            for direction, color in (("CALL", (0, 139, 72)), ("PUT", (221, 0, 22))):
+                state = {**base, "symbol": symbol, "direction": direction}
+                original = copy.deepcopy(state)
+                with (
+                    self.subTest(symbol=symbol, direction=direction),
+                    tempfile.TemporaryDirectory() as tmp,
+                    patch.object(app.bot, "__file__", str(Path(tmp) / "template.py")),
+                    patch.object(app.bot, "fetch_company_logo", return_value=None),
+                ):
+                    output = app.render_trade_card(state)
+                    with app.bot.Image.open(output) as image:
+                        self.assertEqual(image.size, (1080, 1270))
+                        self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
+                        self.assertEqual(image.getpixel((
+                            round(530 * 1080 / 871), round(125 * 1080 / 871),
+                        )), color)
+                    self.assertEqual(state, original)
 
     def test_monitoring_states_do_not_invent_live_prices(self):
         base = {

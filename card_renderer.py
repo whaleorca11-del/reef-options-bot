@@ -4,17 +4,18 @@ from pathlib import Path
 
 
 ASSETS = Path(__file__).resolve().parent / "assets" / "card"
+CARD_STYLE = "white_reference"
 
 
 def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_type,
                 monitor_enabled):
-    # Reference proportions: 683 × 1024, rendered at Telegram-friendly resolution.
-    scale = 1080 / 683
-    image = bot.Image.new("RGB", (1080, 1620), "#00121C")
+    # White reference proportions: 871 × 1024, Telegram-friendly resolution.
+    scale = 1080 / 871
+    image = bot.Image.new("RGB", (1080, round(1024 * scale)), "#FFFFFF")
     draw = bot.ImageDraw.Draw(image)
-    white, muted = "#FAFCFF", "#B1C9E3"
-    cyan, green, red, yellow = "#4BD4F5", "#36ED94", "#FF596D", "#FFD15B"
-    border, panel = "#284C60", "#001621"
+    white, ink, muted = "#FFFFFF", "#001338", "#001338"
+    cyan, green, red, yellow = "#075BCD", "#008B48", "#DD0016", "#FFCB00"
+    border, panel = "#CADDEC", "#EFF7FD"
 
     def coords(values):
         return tuple(round(v * scale) for v in values)
@@ -26,7 +27,7 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
     def line(points, color=border):
         draw.line(coords(points), fill=color, width=round(scale))
 
-    def text(x, y, value, size=18, color=white, bold=False, width=None, align="left"):
+    def text(x, y, value, size=18, color=ink, bold=False, width=None, align="left"):
         value = str(value)
         font_size = round(size * scale)
         font = bot._font(font_size, bold)
@@ -45,9 +46,13 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
         # Align by visible glyph top, rather than varying font ascender offsets.
         draw.text((round(px), round(y * scale) - bounds[1]), value, font=font, fill=color)
 
-    def mark(name, bounds):
+    def mark(name, bounds, tint=None):
         with bot.Image.open(ASSETS / name) as source:
             source = source.convert("RGBA")
+            if tint:
+                alpha = source.getchannel("A")
+                source = bot.Image.new("RGBA", source.size, tint)
+                source.putalpha(alpha)
             x1, y1, x2, y2 = coords(bounds)
             source.thumbnail((x2 - x1, y2 - y1), bot.Image.Resampling.LANCZOS)
             image.paste(source, (x1 + (x2 - x1 - source.width) // 2,
@@ -68,123 +73,126 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
     dte = bot._days_to_expiry(state["expiration"])
 
     # Brand and score.
-    mark("orca-mark.png", (20, 18, 93, 72))
-    text(102, 30, "ORCA", 35, bold=True)
-    line((236, 30, 236, 62), muted)
-    text(252, 38, "OPTIONS SIGNAL", 20, cyan, True, 225)
-    box((488, 25, 661, 68), outline="#28627D", radius=9)
-    text(501, 41, "TEST" if status == "test" else "SCORE", 15,
-         yellow if status == "test" else muted, True)
-    text(649, 38, f"{state['score']}/100", 22, cyan, True, 92, "right")
+    mark("orca-mark.png", (89, 16, 180, 83), tint=ink)
+    text(189, 31, "ORCA", 43, bold=True)
+    line((342, 30, 342, 68), ink)
+    text(358, 38, "OPTIONS SIGNAL", 25, cyan, True, 225)
+    box((594, 18, 803, 70), radius=9)
+    text(609, 38, "TEST" if status == "test" else "SCORE", 18, ink, True)
+    text(790, 34, f"{state['score']}/100", 27, cyan, True, 129, "right")
 
     # Company and direction.
-    box((25, 91, 135, 198), outline="#3B657B", radius=16)
+    box((89, 94, 226, 222), radius=12)
     if symbol == "AAPL":
-        mark("apple-mark.png", (46, 106, 115, 182))
+        mark("apple-mark.png", (113, 106, 204, 211), tint=ink)
+    elif symbol == "NVDA":
+        mark("nvidia-mark.png", (94, 99, 221, 217))
     else:
-        paste_logo(image, symbol, coords((32, 98, 128, 191)))
-    text(160, 87, symbol, 63, bold=True, width=197)
-    text(160, 156, contract, 43, bold=True, width=499)
-    box((365, 86, 547, 142), fill="#062D27" if direction == "CALL" else "#2C1420",
+        paste_logo(image, symbol, coords((95, 100, 220, 216)))
+    text(240, 95, symbol, 86, bold=True, width=266)
+    text(240, 177, contract, 45, bold=True, width=563)
+    box((526, 94, 740, 163), fill=accent,
         outline=accent, radius=13)
-    text(456, 98, f"{direction} {'↗' if direction == 'CALL' else '↘'}",
-         44, accent, True, 169, "center")
+    text(633, 108, f"{direction} {'↗' if direction == 'CALL' else '↘'}",
+         53, white, True, 191, "center")
 
     # Exact contract identifiers remain separate from the underlying price.
-    box((25, 212, 252, 264))
-    text(44, 232, "STRIKE", 17, muted, True)
-    text(234, 228, money(state["strike"]), 24, bold=True, width=128, align="right")
-    box((266, 212, 524, 264))
-    text(284, 232, "EXP", 17, muted, True)
-    text(510, 229, expiration, 21, bold=True, width=181, align="right")
-    box((537, 212, 659, 264))
-    text(598, 229, f"{dte} DTE", 23, bold=True, width=106, align="center")
-    text(25, 288, "Underlying", 18, muted, True)
-    text(144, 283, money(state["stock_price"]), 27, bold=True, width=132)
+    box((89, 232, 357, 286))
+    text(111, 251, "STRIKE", 20, muted, True)
+    text(340, 245, money(state["strike"]), 29, bold=True, width=150, align="right")
+    box((366, 232, 651, 286))
+    text(387, 251, "EXP", 20, muted, True)
+    text(635, 248, expiration, 27, bold=True, width=188, align="right")
+    box((661, 232, 803, 286))
+    text(732, 249, f"{dte} DTE", 28, bold=True, width=124, align="center")
+    box((89, 297, 803, 352))
+    text(111, 314, "Underlying", 24, muted, True)
+    text(263, 310, money(state["stock_price"]), 36, bold=True, width=235)
     if status in ("stopped", "completed"):
-        text(657, 291, status.upper(), 14, red if status == "stopped" else cyan,
+        text(779, 318, status.upper(), 16, red if status == "stopped" else cyan,
              True, 200, "right")
 
     # Entry and stop are sourced from the existing trade, not reference values.
     midpoint = bot.safe_float(state.get("midpoint"))
     entry = midpoint if midpoint > 0 else bot.safe_float(state["entry_price"])
-    box((24, 332, 382, 511), outline=cyan)
-    text(45, 352, "ENTRY MID" if midpoint > 0 else "ENTRY PRICE", 26, cyan, True)
-    text(45, 391, money(entry, 3), 65, bold=True, width=316)
-    line((45, 457, 361, 457), "#376073")
-    text(45, 475, "BID", 20, muted, True)
+    box((89, 363, 480, 550), fill="#EEFBF4", outline="#30B777")
+    text(111, 377, "ENTRY MID" if midpoint > 0 else "ENTRY PRICE", 34, green, True)
+    text(128, 415, money(entry, 3), 83, bold=True, width=330)
+    line((113, 493, 458, 493), "#99B3CE")
+    text(115, 511, "BID", 22, muted, True)
     bid, ask = bot.safe_float(state.get("bid")), bot.safe_float(state.get("ask"))
     valid_quote = bid > 0 and ask >= bid
-    text(100, 473, money(bid) if valid_quote else "N/A", 24, bold=True, width=82)
-    text(194, 473, "/", 23, muted)
-    text(226, 475, "ASK", 20, muted, True)
-    text(359, 473, money(ask) if valid_quote else "N/A", 24, bold=True,
-         width=82, align="right")
-    box((395, 332, 659, 511), fill="#150F17", outline="#DE405A")
-    text(416, 352, "STOP • MID", 26, red, True)
+    text(181, 508, money(bid) if valid_quote else "N/A", 30, bold=True, width=92)
+    text(285, 511, "/", 24, muted)
+    text(307, 511, "ASK", 22, muted, True)
+    text(457, 508, money(ask) if valid_quote else "N/A", 30, bold=True,
+         width=92, align="right")
+    box((491, 363, 803, 550), fill="#FFF0F2", outline="#E6405A")
+    text(511, 377, "STOP • MID", 32, red, True)
     stop = bot.safe_float(state["stop_loss"])
-    text(416, 391, money(stop), 63, bold=True, width=223)
+    text(509, 415, money(stop), 85, bold=True, width=270)
     stop_percent = round((1 - stop / entry) * 100) if entry > 0 else None
-    text(416, 463, f"−{stop_percent}%" if stop_percent is not None else "N/A", 40, red, True)
+    text(647, 494, f"−{stop_percent}%" if stop_percent is not None else "N/A",
+         51, red, True, 270, "center")
 
     # Monitoring is never implied when disabled or no update has been received.
-    box((25, 529, 659, 583))
-    draw.ellipse(coords((44, 547, 63, 566)), fill=green if tracking else yellow)
+    box((89, 560, 803, 613))
+    draw.ellipse(coords((114, 574, 139, 599)), fill=green if tracking else yellow)
     update_label = "PRICE UPDATES ON" if tracking else "PRICE UPDATES WAITING" if monitor_enabled else "PRICE UPDATES OFF"
-    text(84, 548, update_label, 21, green if tracking else yellow, True, 335)
-    line((440, 546, 440, 568))
-    text(642, 550, f"Targets {achieved}/5" if tracking else "Targets not tracked",
-         17, muted, width=192, align="right")
+    text(154, 578, update_label, 23, green if tracking else ink, True, 355)
+    line((526, 574, 526, 602), "#99B3CE")
+    text(776, 576 if tracking else 581,
+         f"Targets {achieved}/5" if tracking else "Targets not tracked",
+         22, muted, width=232, align="right")
     if tracking:
         current = bot.safe_float(state.get("current_price"), entry)
         change = (current / entry - 1) * 100 if entry else 0
-        text(641, 567, f"Mark {money(current)} ({change:+.1f}%)", 11,
-             green if change >= 0 else red, width=197, align="right")
+        text(776, 598, f"Mark {money(current)} ({change:+.1f}%)", 11,
+             green if change >= 0 else red, width=232, align="right")
 
     # Five targets in one row, using the trade's locked prices and progress.
-    box((24, 600, 659, 767))
-    text(44, 615, "TARGETS FROM ENTRY MID", 26, cyan, True, 588)
+    box((89, 623, 803, 837))
+    text(111, 635, "TARGETS FROM ENTRY MID", 32, ink, True, 670)
     targets = list(state["targets"])
     percentages = (20, 45, 70, 100, 150)
     for i in range(5):
-        x = 24 + i * 127
+        x = 89 + i * 142.8
         if i:
-            line((x - 3, 656, x - 3, 751))
+            line((x - 1, 683, x - 1, 828))
         hit = i < achieved
-        draw.ellipse(coords((x + 23, 657, x + 49, 683)), outline=green if hit else cyan,
-                     fill="#084533" if hit else panel, width=round(1.7 * scale))
+        draw.ellipse(coords((x + 31, 687, x + 58, 714)), outline=green if hit else cyan,
+                     fill="#DDF5E8" if hit else panel, width=round(2.5 * scale))
         if hit:
-            text(x + 36, 662, "✓", 17, green, True, align="center")
-        text(x + 65, 663, f"T{i + 1}", 17, muted)
-        text(x + 62, 695, money(targets[i]) if i < len(targets) else "N/A",
-             27, bold=True, width=113, align="center")
-        text(x + 62, 731, f"+{percentages[i]}%", 23, green, True, 110, "center")
+            text(x + 45, 692, "✓", 18, green, True, align="center")
+        text(x + 78, 691, f"T{i + 1}", 22, muted, True)
+        text(x + 71, 739, money(targets[i]) if i < len(targets) else "N/A",
+             40, bold=True, width=126, align="center")
+        text(x + 71, 790, f"+{percentages[i]}%", 35, green, True, 126, "center")
 
     # Keep contract metrics only; Gamma has no visible section or placeholder.
-    box((24, 783, 659, 940))
-    line((342, 798, 342, 923))
-    text(46, 827, "DELTA", 14, muted)
+    box((89, 847, 803, 927))
+    line((445, 862, 445, 916), "#99B3CE")
+    text(111, 858, "DELTA", 18, muted)
     delta = state.get("delta")
-    text(46, 855, "N/A" if delta in (None, "") else f"{bot.safe_float(delta):+.2f}", 24, bold=True)
-    text(380, 827, "IMPLIED VOLATILITY", 14, muted)
+    text(111, 882, "N/A" if delta in (None, "") else f"{bot.safe_float(delta):+.2f}", 44, bold=True)
+    text(480, 858, "IMPLIED VOLATILITY", 18, muted)
     iv = state.get("iv")
     iv_value = bot.safe_float(iv)
-    text(380, 855, "N/A" if iv in (None, "") else f"{iv_value if iv_value > 3 else iv_value * 100:.1f}%",
-         24, bold=True)
+    text(480, 882, "N/A" if iv in (None, "") else f"{iv_value if iv_value > 3 else iv_value * 100:.1f}%",
+         44, bold=True)
 
     # The requested layout retains the quote time and a small strategy audit line.
-    line((24, 959, 659, 959))
     quote_time = state.get("last_successful_option_price_update") if tracking else state.get("entry_quote_timestamp") or state.get("created_at")
-    text(25, 979, f"{'Quote update' if tracking else 'Quote snapshot'} {bot.format_entry_time_et(quote_time)}",
-         15, muted, width=391)
-    text(657, 979, "ORCA WHALE OPTIONS", 17, cyan, True, 234, "right")
+    text(92, 942, f"{'Quote update' if tracking else 'Quote snapshot'} {bot.format_entry_time_et(quote_time)}",
+         19, muted, width=460)
+    text(800, 943, "ORCA WHALE OPTIONS", 22, cyan, True, 254, "right")
     entry_type = state.get("entry_signal_type")
     if entry_type == signal_type:
         audit = f"120/180/40 | 1h | {'GREEN | ABOVE' if direction == 'CALL' else 'RED | BELOW'} EMA200"
-        text(341, 1007, audit, 10, muted, width=630, align="center")
+        text(446, 982, audit, 10, muted, width=700, align="center")
     elif entry_type == "MACD_5M":
-        text(341, 1007, f"120/180/40 | 5m | {'GREEN' if direction == 'CALL' else 'RED'}",
-             10, muted, width=630, align="center")
+        text(446, 982, f"120/180/40 | 5m | {'GREEN' if direction == 'CALL' else 'RED'}",
+             10, muted, width=700, align="center")
 
     output = Path(bot.__file__).with_name("reef_trade_card.png")
     image.save(output, "PNG", optimize=True)
