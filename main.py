@@ -32,7 +32,7 @@ bot.AUTO_SCAN_MIN_SCORE = 75.0
 # Gamma Flip is explicitly disabled as an entry gate and confidence vote.
 GAMMA_DIRECTION_GATE_ENABLED = False
 LIVE_ENTRY_ALERTS_ENABLED = False
-bot.ENTRY_SIGNAL_DESCRIPTION = "Live entry alerts PAUSED; TradingView paper-only EMA9 5m / session VWAP crossings; EMA200 5m preference only; Gamma Flip disabled"
+bot.ENTRY_SIGNAL_DESCRIPTION = "Live entry alerts PAUSED; TradingView paper-only Ichimoku Tenkan9 30m / session VWAP crossings confirmed at 30m close; EMA200 5m preference only; Gamma Flip disabled"
 
 
 def _autonomous_entry_signal_mode():
@@ -4509,10 +4509,10 @@ class CanonicalHandler(bot.Handler):
             self.json_response(200, _PAPER_RECORDER.snapshot(bot.now_new_york()))
             return
         if path == "/paper-script":
-            script = Path(__file__).with_name("ORCA_PAPER_EMA_VWAP_5M.pine").read_bytes()
+            script = Path(__file__).with_name("ORCA_PAPER_TENKAN_VWAP_30M.pine").read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Disposition", 'attachment; filename="ORCA_PAPER_EMA_VWAP_5M.pine"')
+            self.send_header("Content-Disposition", 'attachment; filename="ORCA_PAPER_TENKAN_VWAP_30M.pine"')
             self.send_header("Content-Length", str(len(script)))
             self.end_headers()
             self.wfile.write(script)

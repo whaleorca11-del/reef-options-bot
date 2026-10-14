@@ -343,7 +343,7 @@ class GammaDisabledEntryTests(unittest.TestCase):
 class PaperEntryRulesTests(unittest.TestCase):
     def test_each_indicator_can_trigger_independently(self):
         from paper_entry_rules import crossing_signal
-        for name in ("ema9_5m", "session_vwap"):
+        for name in ("tenkan9_30m", "session_vwap"):
             with self.subTest(indicator=name):
                 result = crossing_signal(99, 101, {name: 100}, {name: 100},
                                          bar_closed=True)
@@ -358,8 +358,8 @@ class PaperEntryRulesTests(unittest.TestCase):
     def test_remaining_above_a_level_is_not_another_entry(self):
         from paper_entry_rules import crossing_signal
         for before, close in ((101, 102), (99, 100)):
-            result = crossing_signal(before, close, {"ema9_5m": 100},
-                                     {"ema9_5m": 100}, bar_closed=True)
+            result = crossing_signal(before, close, {"tenkan9_30m": 100},
+                                     {"tenkan9_30m": 100}, bar_closed=True)
             self.assertIsNone(result["direction"])
 
     def test_open_bar_and_missing_values_cannot_invent_a_signal(self):
@@ -374,8 +374,8 @@ class PaperEntryRulesTests(unittest.TestCase):
     def test_opposite_crosses_are_wait_not_arbitrary_call_or_put(self):
         from paper_entry_rules import crossing_signal
         result = crossing_signal(
-            100, 100, {"ema9_5m": 101, "session_vwap": 99},
-            {"ema9_5m": 99, "session_vwap": 101}, bar_closed=True,
+            100, 100, {"tenkan9_30m": 101, "session_vwap": 99},
+            {"tenkan9_30m": 99, "session_vwap": 101}, bar_closed=True,
         )
         self.assertEqual(result["status"], "WAIT - CONFLICTING CROSSES")
         self.assertIsNone(result["direction"])
@@ -404,12 +404,18 @@ class PaperEntryRulesTests(unittest.TestCase):
         self.assertEqual(result["status"], "PAUSED - PAPER VALIDATION")
         scan.assert_not_called()
 
-    def test_rules_keep_nine_and_two_hundred_on_five_minutes(self):
+    def test_rules_use_thirty_minute_tenkan_and_preserve_five_minute_ema200(self):
         from paper_entry_rules import RULES
-        self.assertEqual(RULES["ema9"], {"type": "EMA", "period": 9, "timeframe": "5m"})
+        self.assertNotIn("ema9", RULES)
+        self.assertEqual(RULES["tenkan9"], {
+            "type": "ICHIMOKU_TENKAN_SEN", "period": 9, "timeframe": "30m",
+            "formula": "(highest_high_9 + lowest_low_9) / 2",
+        })
         self.assertEqual(RULES["ema200"], {"type": "EMA", "period": 200, "timeframe": "5m"})
         self.assertEqual(RULES["trigger_combination"], "OR")
-        self.assertEqual(RULES["trigger_indicators"], ["ema9_5m", "session_vwap"])
+        self.assertEqual(RULES["trigger_indicators"], ["tenkan9_30m", "session_vwap"])
+        self.assertEqual(RULES["entry_timeframe"], "30m")
+        self.assertEqual(RULES["confirmation"], "closed thirty-minute candle")
         self.assertEqual(RULES["ema200_role"], "preference_only_not_entry_trigger_or_gate")
 
 

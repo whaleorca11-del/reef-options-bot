@@ -3,15 +3,18 @@ import math
 
 
 RULES = {
-    "strategy_id": "ORCA_PAPER_CROSS_V3",
-    "entry_timeframe": "5m",
-    "ema9": {"type": "EMA", "period": 9, "timeframe": "5m"},
+    "strategy_id": "ORCA_PAPER_CROSS_V5",
+    "entry_timeframe": "30m",
+    "tenkan9": {
+        "type": "ICHIMOKU_TENKAN_SEN", "period": 9, "timeframe": "30m",
+        "formula": "(highest_high_9 + lowest_low_9) / 2",
+    },
     "ema200": {"type": "EMA", "period": 200, "timeframe": "5m"},
-    "vwap": {"anchor": "US regular trading session"},
+    "vwap": {"anchor": "US regular trading session", "calculation_timeframe": "5m"},
     "trigger_combination": "OR",
-    "trigger_indicators": ["ema9_5m", "session_vwap"],
+    "trigger_indicators": ["tenkan9_30m", "session_vwap"],
     "ema200_role": "preference_only_not_entry_trigger_or_gate",
-    "confirmation": "closed five-minute candle",
+    "confirmation": "closed thirty-minute candle",
     "conflicting_crosses": "WAIT",
 }
 
@@ -47,7 +50,7 @@ def ema200_context(close, level, direction):
 
 
 def crossing_signal(previous_close, close, previous_levels, levels, *, bar_closed):
-    """Price crosses EMA9 or VWAP; EMA200 describes preference, not permission."""
+    """Price crosses Tenkan9 or VWAP; EMA200 describes preference, not permission."""
     if not bar_closed:
         return {"direction": None, "status": "WAIT - CANDLE OPEN", "triggers": []}
     previous_close, close = _positive(previous_close), _positive(close)

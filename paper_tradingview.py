@@ -12,8 +12,8 @@ from paper_entry_rules import RULES, crossing_signal
 
 SIGNAL_TYPE = RULES["strategy_id"]
 NY = ZoneInfo("America/New_York")
-LEVELS = ("ema9_5m", "ema200_5m", "session_vwap")
-HORIZONS = (15, 30, 60)
+LEVELS = ("tenkan9_30m", "ema200_5m", "session_vwap")
+HORIZONS = (30, 60)
 
 
 class PaperDataError(ValueError):
@@ -52,22 +52,23 @@ def from_webhook(payload, now, watchlist, excluded, session_bounds):
         raise PaperDataError("ticker is not permitted")
     if (
         payload.get("signal_type") != SIGNAL_TYPE
-        or payload.get("timeframe") != "5"
+        or payload.get("timeframe") != "30"
         or payload.get("bar_closed") is not True
-        or payload.get("ema9_period") != 9
-        or payload.get("ema9_timeframe") != "5"
-        or payload.get("ema9_basis") != "closed_5m"
+        or payload.get("tenkan_period") != 9
+        or payload.get("tenkan_timeframe") != "30"
+        or payload.get("tenkan_method") != "HIGH_LOW_MIDPOINT"
         or payload.get("ema200_period") != 200
         or payload.get("ema200_timeframe") != "5"
         or payload.get("vwap_anchor") != "US_REGULAR_SESSION"
+        or payload.get("vwap_timeframe") != "5"
         or payload.get("regular_session") is not True
     ):
-        raise PaperDataError("use the ORCA five-minute paper script and closed regular-session bars")
+        raise PaperDataError("use the ORCA thirty-minute paper script and closed regular-session bars")
     start = _stamp(payload, "bar_time_ms")
     end = _stamp(payload, "bar_close_time_ms")
     previous_end = _stamp(payload, "previous_bar_close_time_ms")
-    if end - start != 300000 or previous_end > start:
-        raise PaperDataError("invalid five-minute candle duration or previous candle time")
+    if end - start != 1800000 or previous_end > start:
+        raise PaperDataError("invalid thirty-minute candle duration or previous candle time")
     age = now.timestamp() - end / 1000
     if age < 0 or age > 120:
         raise PaperDataError("candle must be closed and received within 120 seconds")
@@ -82,11 +83,11 @@ def from_webhook(payload, now, watchlist, excluded, session_bounds):
         not bounds
         or local_start < bounds[0] or local_end > bounds[1]
         or local_start.second or local_start.microsecond
-        or local_start.minute % 5
+        or local_start.minute % 30
     ):
         raise PaperDataError("candle is outside a valid regular US session")
     if previous_local.date() == local_start.date():
-        if previous_end != start:
+        if previous_end != start or local_start == bounds[0]:
             raise PaperDataError("previous candle must be consecutive within the session")
     else:
         if local_start != bounds[0]:
@@ -173,7 +174,7 @@ class PaperRecorder:
             prior = state["latest"].get(symbol)
             if prior and end <= prior["bar_close_time_ms"]:
                 if end < prior["bar_close_time_ms"]:
-                    raise PaperConflictError("out-of-order five-minute candle")
+                    raise PaperConflictError("out-of-order thirty-minute candle")
                 old = {k: v for k, v in prior.items() if k != "received_at"}
                 if old != candle:
                     raise PaperConflictError("conflicting values for an already recorded candle")
@@ -220,7 +221,7 @@ class PaperRecorder:
                   if row.get("signal_type") == SIGNAL_TYPE}
         signals = [row for row in state["signals"] if row.get("signal_type") == SIGNAL_TYPE]
         fresh = {
-            symbol: 0 <= now.timestamp() - row["bar_close_time_ms"] / 1000 <= 420
+            symbol: 0 <= now.timestamp() - row["bar_close_time_ms"] / 1000 <= 1920
             for symbol, row in latest.items()
         }
         return {
@@ -235,6 +236,7 @@ class PaperRecorder:
             "outcome_horizons_minutes": list(HORIZONS),
             "outcomes_measure": "stock_direction_only_not_option_profit",
             "contract_selection_enabled": False, "telegram_enabled": False,
-            "ema9_basis": "nine five-minute candles, confirmed at bar close",
+            "entry_timeframe": RULES["entry_timeframe"],
+            "tenkan9_basis": "midpoint of highest high and lowest low over nine thirty-minute candles",
             "ema200_role": RULES["ema200_role"],
         }

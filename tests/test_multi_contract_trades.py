@@ -70,8 +70,8 @@ class MultiContractTradeTests(unittest.TestCase):
                 for previous, close, direction in ((99, 101, "CALL"),
                                                     (101, 99, "PUT"),
                                                     (99, 101, "CALL")):
-                    result = crossing_signal(previous, close, {"ema9_5m": 100},
-                                             {"ema9_5m": 100}, bar_closed=True)
+                    result = crossing_signal(previous, close, {"tenkan9_30m": 100},
+                                             {"tenkan9_30m": 100}, bar_closed=True)
                     self.assertEqual(result["direction"], direction)
                     if direction == "CALL":
                         duplicate = app.create_trade(
