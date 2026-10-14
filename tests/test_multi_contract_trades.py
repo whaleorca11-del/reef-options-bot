@@ -40,6 +40,11 @@ def fresh_entry_contract(contract):
 
 
 class MultiContractTradeTests(unittest.TestCase):
+    def setUp(self):
+        enabled = patch.object(app, "LIVE_ENTRY_ALERTS_ENABLED", True)
+        enabled.start()
+        self.addCleanup(enabled.stop)
+
     def test_distinct_contract_coexists_and_same_contract_is_not_resent(self):
         old_trade = {
             "symbol": "AAPL",

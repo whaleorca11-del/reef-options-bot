@@ -8,6 +8,11 @@ from provider_config import resolve_data_provider
 
 
 class ProviderRetirementTests(unittest.TestCase):
+    def setUp(self):
+        enabled = patch.object(app, "LIVE_ENTRY_ALERTS_ENABLED", True)
+        enabled.start()
+        self.addCleanup(enabled.stop)
+
     def test_default_and_retired_configuration_select_marketdata(self):
         for value in (None, "", "massive", "MASSIVE", "polygon", "polygon.io"):
             with self.subTest(value=value):

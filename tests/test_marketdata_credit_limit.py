@@ -16,6 +16,9 @@ class FakeResponse:
 
 class MarketDataCreditLimitTests(unittest.TestCase):
     def setUp(self):
+        enabled = patch.object(app, "LIVE_ENTRY_ALERTS_ENABLED", True)
+        enabled.start()
+        self.addCleanup(enabled.stop)
         self.credit_limit_patcher = patch.object(
             app, "_MARKETDATA_QUOTA", MarketDataQuota()
         )

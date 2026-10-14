@@ -96,6 +96,7 @@ class AutonomousEntryTests(unittest.TestCase):
     """Compatibility coverage explicitly opts into the former Gamma gate."""
     def setUp(self):
         self.patches = [
+            patch.object(app, "LIVE_ENTRY_ALERTS_ENABLED", True),
             patch.object(app, "GAMMA_DIRECTION_GATE_ENABLED", True),
             patch.object(bot, "now_new_york", return_value=NOW),
             patch.object(app.time, "time", return_value=NOW.timestamp()),
@@ -337,6 +338,77 @@ class GammaDisabledEntryTests(unittest.TestCase):
             }),
             ("OFF", "DISABLED"),
         )
+
+
+class PaperEntryRulesTests(unittest.TestCase):
+    def test_each_indicator_can_trigger_independently(self):
+        from paper_entry_rules import crossing_signal
+        for name in ("ema9_daily", "ema200_5m", "session_vwap"):
+            with self.subTest(indicator=name):
+                result = crossing_signal(99, 101, {name: 100}, {name: 100},
+                                         bar_closed=True)
+                self.assertEqual(result["direction"], "CALL")
+                self.assertEqual(result["triggers"], [
+                    {"indicator": name, "direction": "CALL"},
+                ])
+                result = crossing_signal(101, 99, {name: 100}, {name: 100},
+                                         bar_closed=True)
+                self.assertEqual(result["direction"], "PUT")
+
+    def test_remaining_above_a_level_is_not_another_entry(self):
+        from paper_entry_rules import crossing_signal
+        for before, close in ((101, 102), (99, 100)):
+            result = crossing_signal(before, close, {"ema200_5m": 100},
+                                     {"ema200_5m": 100}, bar_closed=True)
+            self.assertIsNone(result["direction"])
+
+    def test_open_bar_and_missing_values_cannot_invent_a_signal(self):
+        from paper_entry_rules import crossing_signal
+        result = crossing_signal(99, 101, {"session_vwap": 100},
+                                 {"session_vwap": 100}, bar_closed=False)
+        self.assertEqual(result["status"], "WAIT - CANDLE OPEN")
+        result = crossing_signal(99, 101, {"session_vwap": None},
+                                 {"session_vwap": float("nan")}, bar_closed=True)
+        self.assertEqual(result["status"], "WAIT - INDICATOR DATA")
+
+    def test_opposite_crosses_are_wait_not_arbitrary_call_or_put(self):
+        from paper_entry_rules import crossing_signal
+        result = crossing_signal(
+            100, 100, {"ema9_daily": 101, "ema200_5m": 99},
+            {"ema9_daily": 99, "ema200_5m": 101}, bar_closed=True,
+        )
+        self.assertEqual(result["status"], "WAIT - CONFLICTING CROSSES")
+        self.assertIsNone(result["direction"])
+
+    def test_live_trade_and_direct_telegram_are_paused_before_side_effects(self):
+        with (
+            patch.object(app, "LIVE_ENTRY_ALERTS_ENABLED", False),
+            patch.object(bot, "_load_trade_store") as load,
+            patch.object(app, "refresh_contract_quote_for_entry") as quote,
+            patch.object(app.requests, "post") as post,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "LIVE ENTRY ALERTS PAUSED"):
+                app.create_trade("AAPL", "CALL", 200)
+            with self.assertRaisesRegex(RuntimeError, "LIVE ENTRY ALERTS PAUSED"):
+                app.telegram_send_card({"status": "active"})
+            load.assert_not_called()
+            quote.assert_not_called()
+            post.assert_not_called()
+
+    def test_forced_scan_cannot_bypass_pause_or_consume_quotes(self):
+        with (
+            patch.object(app, "LIVE_ENTRY_ALERTS_ENABLED", False),
+            patch.object(app, "scan_symbol_options") as scan,
+        ):
+            result = app.scan_watchlist_once(force=True)
+        self.assertEqual(result["status"], "PAUSED - PAPER VALIDATION")
+        scan.assert_not_called()
+
+    def test_rules_keep_daily_nine_and_intraday_two_hundred(self):
+        from paper_entry_rules import RULES
+        self.assertEqual(RULES["ema9"], {"type": "EMA", "period": 9, "timeframe": "1d"})
+        self.assertEqual(RULES["ema200"], {"type": "EMA", "period": 200, "timeframe": "5m"})
+        self.assertEqual(RULES["trigger_combination"], "OR")
 
 
 class TradingViewMacdTests(unittest.TestCase):

@@ -330,6 +330,7 @@ class ThirtyMinuteIchimokuGateTests(unittest.TestCase):
                 side_effect=AssertionError("Ichimoku must not gate entry"),
             ),
             patch.object(bot, "telegram_send_card", return_value=12),
+            patch.object(app, "LIVE_ENTRY_ALERTS_ENABLED", True),
             patch.object(app, "_paper_trade_record", return_value={"symbol": "AAPL"}),
             patch.object(app, "_gamma_state_fields", return_value={}),
             patch.object(

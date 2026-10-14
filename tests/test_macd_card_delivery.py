@@ -187,6 +187,7 @@ class MacdCardDeliveryTests(unittest.TestCase):
                     patch.object(app.bot, "env", return_value="unit-test-only"),
                     patch.object(app, "_render_unique_card", return_value=photo),
                     patch.object(app.requests, "post", return_value=response) as post,
+                    patch.object(app, "LIVE_ENTRY_ALERTS_ENABLED", True),
                     patch.object(app.bot, "_load_trade_store") as load,
                     patch.object(app.bot, "_save_trade_store") as save,
                 ):

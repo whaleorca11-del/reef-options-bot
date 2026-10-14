@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 import requests
 import macd_direction
 from card_renderer import CARD_STYLE
+from paper_entry_rules import RULES as PAPER_ENTRY_RULES
 from marketdata_quota import MarketDataQuota
 from provider_config import PROVIDER_KEYS, REMOVED_PROVIDERS, resolve_data_provider
 
@@ -29,7 +30,8 @@ import orca_whale_options_bot_FAST_60S_5S as bot
 bot.AUTO_SCAN_MIN_SCORE = 75.0
 # Gamma Flip is explicitly disabled as an entry gate and confidence vote.
 GAMMA_DIRECTION_GATE_ENABLED = False
-bot.ENTRY_SIGNAL_DESCRIPTION = "Autonomous ORCA contract score and relative option activity -> fresh option quote -> Telegram; Gamma Flip disabled; no MACD/EMA200 entry gate"
+LIVE_ENTRY_ALERTS_ENABLED = False
+bot.ENTRY_SIGNAL_DESCRIPTION = "Live entry alerts PAUSED for paper validation; EMA9 daily / EMA200 5m / session VWAP crossing rules await a data source; Gamma Flip disabled"
 
 
 def _autonomous_entry_signal_mode():
@@ -1921,6 +1923,8 @@ def telegram_edit_card_retry(message_id, state, attempts=TELEGRAM_EDIT_ATTEMPTS)
 
 def telegram_send_card(state):
     """Send the exact contract card and retry transient Telegram failures."""
+    if not LIVE_ENTRY_ALERTS_ENABLED and str(state.get("status", "")).lower() != "test":
+        raise RuntimeError("LIVE ENTRY ALERTS PAUSED - PAPER VALIDATION")
     token, chat_id = bot.env("TELEGRAM_BOT_TOKEN"), bot.env("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         raise RuntimeError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
@@ -3116,6 +3120,8 @@ def create_trade(
     allow_strong_score_exception=False,
 ):
     """Lock and open the exact contract that qualified during the scan."""
+    if not LIVE_ENTRY_ALERTS_ENABLED:
+        raise RuntimeError("LIVE ENTRY ALERTS PAUSED - PAPER VALIDATION")
     symbol = str(symbol or "").upper().strip()
     direction = str(direction or "").upper().strip()
     if symbol in bot.EXCLUDED_SYMBOLS:
@@ -3887,6 +3893,12 @@ def _scan_log_summary(item):
 
 def scan_watchlist_once(force=False, opening_window_only=False):
     """Run at most one scanner pass process-wide."""
+    if not LIVE_ENTRY_ALERTS_ENABLED:
+        return {
+            "accepted": True, "status": "PAUSED - PAPER VALIDATION",
+            "ignored": "live entry alerts paused by user; paper data source not configured",
+            "checked": 0, "results": [],
+        }
     if not SCAN_IN_PROGRESS_LOCK.acquire(blocking=False):
         return {"accepted": True, "ignored": "scan already in progress"}
 
@@ -4457,6 +4469,9 @@ def start_auto_monitor():
 
 
 def start_auto_scanner():
+    if not LIVE_ENTRY_ALERTS_ENABLED:
+        print("Live entry scanner paused for paper validation; awaiting data source")
+        return None
     if not bot.AUTO_SCAN_ENABLED:
         return None
     return _start_thread_once(
@@ -4586,6 +4601,11 @@ class CanonicalHandler(bot.Handler):
                                         "entry_signal_mode": _autonomous_entry_signal_mode(),
                                         "card_gamma_section_visible": False,
                                         "card_style": CARD_STYLE,
+                                        "live_entry_alerts_enabled": LIVE_ENTRY_ALERTS_ENABLED,
+                                        "paper_entry": {
+                                            "status": "awaiting_data_source",
+                                            "rules": PAPER_ENTRY_RULES,
+                                        },
                                         "macd_settings": {
                                             "entry_gate_enabled": False,
                                             "fast": 120, "slow": 180, "signal": 40,
