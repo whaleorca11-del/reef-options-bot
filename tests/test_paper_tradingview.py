@@ -225,7 +225,7 @@ class PaperStorageTests(unittest.TestCase):
 
 
 class PaperHttpTests(unittest.TestCase):
-    def test_http_auth_record_results_script_and_no_live_side_effects(self):
+    def test_disabled_paper_routes_preserve_archived_data_and_do_not_scan(self):
         with (
             tempfile.TemporaryDirectory() as temp,
             patch.object(app, "_PAPER_RECORDER", paper.PaperRecorder(Path(temp) / "paper.json")),
@@ -256,23 +256,24 @@ class PaperHttpTests(unittest.TestCase):
                 except HTTPError as error:
                     return error.code, json.load(error)
             try:
-                self.assertEqual(send({**payload(), "secret": "wrong"})[0], 401)
-                self.assertEqual(send([])[0], 400)
-                self.assertEqual(send(payload())[0], 200)
-                self.assertTrue(send(payload())[1]["duplicate"])
-                self.assertEqual(send({**payload(), "close": 102})[0], 409)
-                self.assertEqual(send({**payload(), "bar_closed": False})[0], 400)
+                self.assertEqual(send({**payload(), "secret": "wrong"})[0], 410)
+                self.assertEqual(send([])[0], 410)
+                self.assertEqual(send(payload())[0], 410)
+                self.assertEqual(send(payload())[1]["error"],
+                                 "Paper TradingView testing is disabled; historical results are archived")
                 secret.return_value = ""
-                self.assertEqual(send(payload())[0], 503)
+                self.assertEqual(send(payload())[0], 410)
                 with urlopen(base + "/paper-results") as response:
                     results = json.load(response)
-                    self.assertEqual(results["signal_count"], 1)
-                    self.assertEqual(results["paper_options"]["status_counts"], {"QUEUED": 1})
-                    self.assertEqual(results["recent_signals"][0]["contract_status"], "QUEUED")
+                    self.assertEqual(results["signal_count"], 0)
+                    self.assertFalse(results["paper_testing_enabled"])
+                    self.assertTrue(results["archived_only"])
+                    self.assertFalse(results["paper_options"]["evaluation_enabled"])
                 with urlopen(base + "/paper-option-results") as response:
-                    self.assertEqual(json.load(response)["total_signals"], 1)
-                with urlopen(base + "/paper-script") as response:
-                    self.assertIn(paper.SIGNAL_TYPE, response.read().decode())
+                    self.assertFalse(json.load(response)["evaluation_enabled"])
+                with self.assertRaises(HTTPError) as disabled_script:
+                    urlopen(base + "/paper-script")
+                self.assertEqual(disabled_script.exception.code, 410)
                 trade.assert_not_called()
                 chain.assert_not_called()
                 telegram.assert_not_called()

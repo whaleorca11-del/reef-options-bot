@@ -30,10 +30,14 @@ import orca_whale_options_bot_FAST_60S_5S as bot
 
 # Canonical production scanner threshold for this entry point.
 bot.AUTO_SCAN_MIN_SCORE = 75.0
+LIVE_AUTO_SCAN_INTERVAL_SECONDS = 15 * 60
+LIVE_AUTO_SCAN_START_DELAY_MINUTES = 15
+bot.AUTO_SCAN_SECONDS = LIVE_AUTO_SCAN_INTERVAL_SECONDS
 # Gamma Flip is explicitly disabled as an entry gate and confidence vote.
 GAMMA_DIRECTION_GATE_ENABLED = False
-LIVE_ENTRY_ALERTS_ENABLED = False
-bot.ENTRY_SIGNAL_DESCRIPTION = "Live entry alerts PAUSED; TradingView paper-only Ichimoku Tenkan9 30m / session VWAP crossings confirmed at 30m close; EMA200 5m preference only; Gamma Flip disabled"
+LIVE_ENTRY_ALERTS_ENABLED = True
+PAPER_TESTING_ENABLED = False
+bot.ENTRY_SIGNAL_DESCRIPTION = "Live autonomous option alerts enabled; MarketData; scan starts 15 minutes after the US open, then every 15 minutes through the regular session; Gamma Flip disabled"
 
 
 def _autonomous_entry_signal_mode():
@@ -50,8 +54,9 @@ AUTO_SCAN_OPENING_WINDOW_MINUTES = max(
     0, int(os.getenv("AUTO_SCAN_OPENING_WINDOW_MINUTES", "390"))
 )
 AUTO_SCAN_OPENING_INTERVAL_SECONDS = max(
-    60.0, float(os.getenv("AUTO_SCAN_OPENING_INTERVAL_SECONDS", "180"))
+    60.0, float(os.getenv("AUTO_SCAN_OPENING_INTERVAL_SECONDS", "900"))
 )
+AUTO_SCAN_OPENING_INTERVAL_SECONDS = LIVE_AUTO_SCAN_INTERVAL_SECONDS
 AUTO_MONITOR_ENABLED = os.getenv(
     "AUTO_MONITOR_ENABLED", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -4200,7 +4205,7 @@ def _scanner_result_counts(result):
 
 
 def _is_within_auto_scan_window(now=None):
-    """Return whether now is within the configured opening-session scan window."""
+    """Scan after the requested post-open delay through the full regular session."""
     if AUTO_SCAN_OPENING_WINDOW_MINUTES <= 0:
         return False
     now = now or bot.now_new_york()
@@ -4209,7 +4214,7 @@ def _is_within_auto_scan_window(now=None):
     minutes = now.hour * 60 + now.minute
     market_open_minute = 9 * 60 + 30
     return (
-        market_open_minute
+        market_open_minute + LIVE_AUTO_SCAN_START_DELAY_MINUTES
         <= minutes
         < market_open_minute + AUTO_SCAN_OPENING_WINDOW_MINUTES
     )
@@ -4232,24 +4237,17 @@ def _seconds_until_next_auto_scan(
     if elapsed_seconds < 0:
         return max(1.0, -elapsed_seconds)
 
-    fast_window_seconds = 15 * 60
-    if elapsed_seconds < fast_window_seconds:
-        opening_interval_seconds = (
-            opening_interval_seconds
-            if opening_interval_seconds is not None
-            else AUTO_SCAN_OPENING_INTERVAL_SECONDS
-        )
-        cadence_seconds = max(60.0, float(opening_interval_seconds))
-    else:
-        regular_interval_seconds = (
-            regular_interval_seconds
-            if regular_interval_seconds is not None
-            else getattr(bot, "AUTO_SCAN_SECONDS", 900)
-        )
-        cadence_seconds = max(60.0, float(regular_interval_seconds))
-
-    next_slot = (int(elapsed_seconds // cadence_seconds) + 1) * cadence_seconds
-    return max(1.0, next_slot - elapsed_seconds)
+    first_scan_seconds = LIVE_AUTO_SCAN_START_DELAY_MINUTES * 60
+    if elapsed_seconds < first_scan_seconds:
+        return max(1.0, first_scan_seconds - elapsed_seconds)
+    cadence_seconds = max(
+        60.0,
+        float(regular_interval_seconds if regular_interval_seconds is not None
+              else LIVE_AUTO_SCAN_INTERVAL_SECONDS),
+    )
+    elapsed_after_start = elapsed_seconds - first_scan_seconds
+    elapsed_in_slot = elapsed_after_start % cadence_seconds
+    return max(1.0, cadence_seconds - elapsed_in_slot)
 
 
 def _seconds_until_next_market_open(now=None):
@@ -4278,11 +4276,10 @@ def _seconds_until_next_market_open(now=None):
 
 def auto_scan_loop():
     """Run the canonical scanner forever, even when a pass raises unexpectedly."""
-    interval = max(float(getattr(bot, "AUTO_SCAN_SECONDS", 3600)), 60.0)
-    opening_interval = AUTO_SCAN_OPENING_INTERVAL_SECONDS
+    interval = LIVE_AUTO_SCAN_INTERVAL_SECONDS
+    opening_interval = LIVE_AUTO_SCAN_INTERVAL_SECONDS
     print(
-        f"ORCA canonical scanner: every {opening_interval:g}s for the first "
-        f"15 minutes after 09:30 New York, then every {interval:g}s; "
+        f"ORCA canonical scanner: first scan at 09:45 New York, then every {interval:g}s; "
         "scanning only during the "
         f"first {AUTO_SCAN_OPENING_WINDOW_MINUTES} minutes of the session"
     )
@@ -4312,7 +4309,13 @@ def auto_scan_loop():
             elif not _is_within_auto_scan_window(now):
                 _scanner_status_update(
                     last_cycle_finished=bot.now_new_york().isoformat(timespec="seconds"),
-                    last_cycle_status="outside opening scan window",
+                    last_cycle_status=(
+                        "waiting for 15-minute opening delay"
+                        if bot.market_is_open_now(now)
+                        and now.hour * 60 + now.minute < 9 * 60 + 30
+                        + LIVE_AUTO_SCAN_START_DELAY_MINUTES
+                        else "outside regular-session scan window"
+                    ),
                     last_cycle_checked=0,
                     last_cycle_trades=0,
                     last_cycle_errors=0,
@@ -4320,7 +4323,13 @@ def auto_scan_loop():
                     last_cycle_skipped=0,
                     last_cycle_error=None,
                 )
-                delay = _seconds_until_next_market_open(now)
+                if bot.market_is_open_now(now):
+                    delay = _seconds_until_next_auto_scan(
+                        now, regular_interval_seconds=interval,
+                        opening_interval_seconds=opening_interval,
+                    )
+                else:
+                    delay = _seconds_until_next_market_open(now)
             else:
                 result = scan_watchlist_once(False, opening_window_only=True)
                 counts = _scanner_result_counts(result)
@@ -4560,6 +4569,19 @@ _PAPER_OPTIONS = paper_options.PaperOptionEngine(
 def _paper_snapshot(now):
     stock = _PAPER_RECORDER.snapshot(now)
     options = _PAPER_OPTIONS.snapshot(now)
+    stock_status = stock.get("status")
+    stock.update(
+        paper_testing_enabled=PAPER_TESTING_ENABLED,
+        archived_only=not PAPER_TESTING_ENABLED,
+        archived_live_status=stock_status if not PAPER_TESTING_ENABLED else None,
+        status="paper_testing_disabled_archived_only" if not PAPER_TESTING_ENABLED else stock_status,
+    )
+    options.update(
+        evaluation_enabled=PAPER_TESTING_ENABLED,
+        archived_only=not PAPER_TESTING_ENABLED,
+        contract_selection_enabled=PAPER_TESTING_ENABLED,
+        telegram_enabled=LIVE_ENTRY_ALERTS_ENABLED,
+    )
     lookup = {row["id"]: row for row in options.get("recent_records", [])}
     recent = []
     for signal in stock.get("recent_signals", []):
@@ -4568,9 +4590,12 @@ def _paper_snapshot(now):
         recent.append({**signal, **({
             "contract_status": row["status"], "paper_option_contract": row["contract"],
             "option_profitability": row["outcomes"].get("60"),
-        } if row else {})})
+        } if row and PAPER_TESTING_ENABLED else
+            {"archived_only": True} if not PAPER_TESTING_ENABLED else {})})
     return {
-        **stock, "recent_signals": recent, "contract_selection_enabled": True,
+        **stock, "recent_signals": recent,
+        "contract_selection_enabled": PAPER_TESTING_ENABLED,
+        "paper_testing_enabled": PAPER_TESTING_ENABLED,
         "paper_options": options,
         "allowed_symbols": [s for s in bot.WATCHLIST if s not in bot.EXCLUDED_SYMBOLS],
         "requires_tradingview_alert_for_each_symbol": True,
@@ -4586,9 +4611,19 @@ class CanonicalHandler(bot.Handler):
             self.json_response(200, _paper_snapshot(bot.now_new_york()))
             return
         if path == "/paper-option-results":
-            self.json_response(200, _PAPER_OPTIONS.snapshot(bot.now_new_york()))
+            options = _PAPER_OPTIONS.snapshot(bot.now_new_york())
+            options.update(
+                evaluation_enabled=PAPER_TESTING_ENABLED,
+                archived_only=not PAPER_TESTING_ENABLED,
+                contract_selection_enabled=PAPER_TESTING_ENABLED,
+                telegram_enabled=LIVE_ENTRY_ALERTS_ENABLED,
+            )
+            self.json_response(200, options)
             return
         if path == "/paper-script":
+            if not PAPER_TESTING_ENABLED:
+                self.json_response(410, {"error": "Paper TradingView testing is disabled"})
+                return
             script = Path(__file__).with_name("ORCA_PAPER_TENKAN_VWAP_30M.pine").read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -4710,6 +4745,10 @@ class CanonicalHandler(bot.Handler):
                                         "card_gamma_section_visible": False,
                                         "card_style": CARD_STYLE,
                                         "live_entry_alerts_enabled": LIVE_ENTRY_ALERTS_ENABLED,
+                                        "paper_testing_enabled": PAPER_TESTING_ENABLED,
+                                        "auto_scan_start_delay_minutes": (
+                                            LIVE_AUTO_SCAN_START_DELAY_MINUTES
+                                        ),
                                         "paper_entry": {
                                             **_paper_snapshot(bot.now_new_york()),
                                             "rules": PAPER_ENTRY_RULES,
@@ -4741,6 +4780,11 @@ class CanonicalHandler(bot.Handler):
     def do_POST(self):
         path = urlparse(self.path).path
         if path == "/paper-signal":
+            if not PAPER_TESTING_ENABLED:
+                self.json_response(410, {
+                    "error": "Paper TradingView testing is disabled; historical results are archived",
+                })
+                return
             secret = bot.env("REEF_WEBHOOK_SECRET")
             if not secret:
                 self.json_response(503, {"error": "webhook authentication is not configured"})
@@ -4982,7 +5026,10 @@ def main():
     except TradeStateCorruptionError as error:
         print("FATAL durable trade-state recovery error:", error)
         return
-    _PAPER_OPTIONS.start()
+    if PAPER_TESTING_ENABLED:
+        _PAPER_OPTIONS.start()
+    else:
+        print("Paper TradingView and option testing disabled; historical records retained")
     bot.main()
 
 

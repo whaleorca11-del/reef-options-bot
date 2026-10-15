@@ -331,5 +331,26 @@ class PaperOptionProviderTests(unittest.TestCase):
             chain.assert_not_called()
 
 
+class LiveModeControlTests(unittest.TestCase):
+    def test_live_alerts_are_on_gamma_and_paper_testing_are_off(self):
+        self.assertTrue(app.LIVE_ENTRY_ALERTS_ENABLED)
+        self.assertFalse(app.GAMMA_DIRECTION_GATE_ENABLED)
+        self.assertFalse(app.PAPER_TESTING_ENABLED)
+        self.assertEqual(app.LIVE_AUTO_SCAN_START_DELAY_MINUTES, 15)
+        self.assertEqual(app.LIVE_AUTO_SCAN_INTERVAL_SECONDS, 900)
+        self.assertEqual(app.bot.AUTO_SCAN_SECONDS, 900)
+
+    def test_scanning_starts_at_quarter_past_and_continues_every_15_minutes(self):
+        at_open = NOW.replace(hour=9, minute=30, second=0)
+        self.assertFalse(app._is_within_auto_scan_window(at_open.replace(minute=44, second=59)))
+        self.assertTrue(app._is_within_auto_scan_window(at_open.replace(minute=45)))
+        self.assertTrue(app._is_within_auto_scan_window(at_open.replace(hour=15, minute=59)))
+        self.assertFalse(app._is_within_auto_scan_window(at_open.replace(hour=16, minute=0)))
+        self.assertEqual(app._seconds_until_next_auto_scan(at_open), 900)
+        self.assertEqual(app._seconds_until_next_auto_scan(at_open.replace(minute=40)), 300)
+        self.assertEqual(app._seconds_until_next_auto_scan(at_open.replace(minute=45)), 900)
+        self.assertEqual(app._seconds_until_next_auto_scan(at_open.replace(hour=10, minute=0)), 900)
+
+
 if __name__ == "__main__":
     unittest.main()
