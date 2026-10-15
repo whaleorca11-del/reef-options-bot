@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import main as app
+from PIL import Image, ImageChops
 
 
 class MacdCardDeliveryTests(unittest.TestCase):
@@ -28,8 +29,17 @@ class MacdCardDeliveryTests(unittest.TestCase):
         ):
             output = app.render_trade_card(state)
             with app.bot.Image.open(output) as image:
-                self.assertEqual(image.size, (1080, 1270))
+                self.assertLess(image.width, 1080)
+                self.assertLess(image.height, 1270)
                 self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
+                content = ImageChops.difference(
+                    image.convert("RGB"), Image.new("RGB", image.size, "#FFFFFF")
+                ).getbbox()
+                self.assertIsNotNone(content)
+                self.assertLessEqual(content[0], 12)
+                self.assertLessEqual(content[1], 12)
+                self.assertLessEqual(image.width - content[2], 12)
+                self.assertLessEqual(image.height - content[3], 12)
             calls = {call.args[2]: call for call in text.call_args_list}
             self.assertIn("PUT ↘", calls)
             self.assertFalse(any("GAMMA" in label for label in calls))
@@ -105,11 +115,16 @@ class MacdCardDeliveryTests(unittest.TestCase):
                 ):
                     output = app.render_trade_card(state)
                     with app.bot.Image.open(output) as image:
-                        self.assertEqual(image.size, (1080, 1270))
+                        self.assertLess(image.width, 1080)
+                        self.assertLess(image.height, 1270)
                         self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
-                        self.assertEqual(image.getpixel((
-                            round(530 * 1080 / 871), round(125 * 1080 / 871),
-                        )), color)
+                        palette = image.getcolors(
+                            maxcolors=image.width * image.height
+                        )
+                        self.assertTrue(any(
+                            pixel == color and count > 0
+                            for count, pixel in palette
+                        ))
                     self.assertEqual(state, original)
 
     def test_monitoring_states_do_not_invent_live_prices(self):

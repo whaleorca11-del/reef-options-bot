@@ -1,6 +1,7 @@
 """Reference-matched ORCA card. Presentation only; never mutates trade state."""
 from datetime import date
 from pathlib import Path
+from PIL import Image, ImageChops
 
 
 ASSETS = Path(__file__).resolve().parent / "assets" / "card"
@@ -193,6 +194,20 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
     elif entry_type == "MACD_5M":
         text(446, 982, f"120/180/40 | 5m | {'GREEN' if direction == 'CALL' else 'RED'}",
              10, muted, width=700, align="center")
+
+    # Telegram crops oversized canvases in previews. Trim the unused white
+    # border while keeping a small, even white inset around every visible mark.
+    white_background = Image.new("RGB", image.size, "#FFFFFF")
+    content_box = ImageChops.difference(image, white_background).getbbox()
+    if content_box:
+        padding = round(8 * scale)
+        left, top, right, bottom = content_box
+        image = image.crop((
+            max(0, left - padding),
+            max(0, top - padding),
+            min(image.width, right + padding),
+            min(image.height, bottom + padding),
+        ))
 
     output = Path(bot.__file__).with_name("reef_trade_card.png")
     image.save(output, "PNG", optimize=True)
