@@ -2,6 +2,7 @@ import copy
 import tempfile
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -85,13 +86,15 @@ class MultiContractTradeTests(unittest.TestCase):
                 quote.assert_not_called()
                 save.assert_not_called()
 
-    def test_distinct_contract_coexists_and_same_contract_is_not_resent(self):
+    def test_new_symbol_alert_is_allowed_after_previous_trading_day(self):
+        now = bot.now_new_york()
         old_trade = {
             "symbol": "AAPL",
             "contract_ticker": "AAPL261022C00215000",
             "direction": "CALL",
             "status": "active",
             "message_id": 10,
+            "created_at": (now - timedelta(days=1)).isoformat(timespec="seconds"),
             "entry_price": 4.0,
         }
         original_old_trade = copy.deepcopy(old_trade)
@@ -142,6 +145,69 @@ class MultiContractTradeTests(unittest.TestCase):
         self.assertTrue(duplicate["_ignored_duplicate"])
         self.assertEqual(len(store["trades"]), 2)
         send_card.assert_called_once()
+
+    def test_same_symbol_cannot_send_a_second_contract_on_the_same_ny_day(self):
+        now = bot.now_new_york()
+        first_trade = {
+            "symbol": "AAPL",
+            "contract_ticker": "AAPL261022C00215000",
+            "direction": "CALL",
+            "status": "active",
+            "message_id": 10,
+            "created_at": now.isoformat(timespec="seconds"),
+        }
+        store = {"trades": {"AAPL": first_trade}, "pending_candidates": {}}
+        contract = option("AAPL261022P00215000")
+
+        with (
+            patch.object(bot, "_load_trade_store", side_effect=lambda: store),
+            patch.object(bot, "_save_trade_store") as save,
+            patch.object(bot, "now_new_york", return_value=now),
+            patch.object(app, "refresh_contract_quote_for_entry") as quote,
+            patch.object(bot, "telegram_send_card") as send_card,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "SYMBOL_ALREADY_ALERTED_TODAY"):
+                app.create_trade("AAPL", "PUT", 215, contract=contract)
+
+        self.assertEqual(store["trades"], {"AAPL": first_trade})
+        save.assert_not_called()
+        quote.assert_not_called()
+        send_card.assert_not_called()
+
+    def test_symbol_daily_guard_uses_new_york_date_for_utc_timestamps(self):
+        market_date = bot.now_new_york().date()
+        utc_midnight_next_day = datetime.combine(
+            market_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+        )
+        store = {"trades": {"AAPL": {
+            "symbol": "AAPL",
+            "created_at": utc_midnight_next_day.isoformat(),
+            "status": "active",
+            "message_id": 10,
+        }}}
+
+        self.assertTrue(app._symbol_alerted_today(store, "AAPL"))
+
+    def test_scanner_skips_option_chain_after_symbol_alert_today(self):
+        now = bot.now_new_york()
+        store = {"trades": {"AAPL": {
+            "symbol": "AAPL",
+            "contract_ticker": "AAPL261022C00215000",
+            "direction": "CALL",
+            "status": "active",
+            "message_id": 10,
+            "created_at": now.isoformat(timespec="seconds"),
+        }}}
+        with (
+            patch.object(bot, "_load_trade_store", side_effect=lambda: store),
+            patch.object(bot, "now_new_york", return_value=now),
+            patch.object(app, "massive_chain") as chain,
+        ):
+            result = app.scan_symbol_options("AAPL")
+
+        self.assertEqual(result["status"], "SYMBOL ALREADY ALERTED TODAY")
+        self.assertIn("one alert per symbol", result["ignored"])
+        chain.assert_not_called()
 
     def test_scanner_filters_used_contract_without_blocking_active_symbol(self):
         old_ticker = "AAPL261022C00215000"

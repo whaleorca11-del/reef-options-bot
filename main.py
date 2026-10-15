@@ -267,6 +267,53 @@ def _iter_trade_entries(store, symbol=None):
             yield trade_key, trade_symbol, trade
 
 
+def _trade_created_market_date(trade):
+    """Resolve a trade's creation date in New York, regardless of stored offset."""
+    created_at = str((trade or {}).get("created_at") or "").strip()
+    if not created_at:
+        return None
+    try:
+        timestamp = bot.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=bot.NEW_YORK_TZ)
+    return timestamp.astimezone(bot.NEW_YORK_TZ).date()
+
+
+def _symbol_alerted_today(store, symbol, now=None):
+    """Whether this symbol already has a sent or possibly-sent card today in ET."""
+    symbol = str(symbol or "").upper().strip()
+    now = now or bot.now_new_york()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=bot.NEW_YORK_TZ)
+    market_date = now.astimezone(bot.NEW_YORK_TZ).date()
+    for _, trade_symbol, trade in _iter_trade_entries(store, symbol):
+        if trade_symbol != symbol or _trade_created_market_date(trade) != market_date:
+            continue
+        # A reservation known to be unsent after a restart is not an alert.
+        if (
+            str(trade.get("status") or "").lower() == "cancelled"
+            and not trade.get("message_id")
+            and trade.get("telegram_send_state") not in ("sending", "sent")
+        ):
+            continue
+        return True
+    return False
+
+
+def _symbol_already_alerted_result(symbol):
+    reason = "one alert per symbol per New York trading day"
+    return {
+        "symbol": symbol,
+        "accepted": False,
+        "status": "SYMBOL ALREADY ALERTED TODAY",
+        "call": {"accepted": False, "reason": reason},
+        "put": {"accepted": False, "reason": reason},
+        "ignored": reason,
+    }
+
+
 def _trade_storage_key(symbol, contract_ticker):
     normalized_symbol = str(symbol or "").upper().strip()
     normalized_ticker = bot.canonical_option_ticker(contract_ticker)
@@ -3199,6 +3246,8 @@ def create_trade(
             result = dict(existing)
             result["_ignored_duplicate"] = True
             return result
+        if _symbol_alerted_today(store, symbol):
+            raise RuntimeError("SYMBOL_ALREADY_ALERTED_TODAY")
         created_at = bot.now_new_york().isoformat(timespec="seconds")
         reservation = {"symbol": symbol, "trade_record_key": trade_key,
                        "direction": direction, "stock_price": stock_price,
@@ -3635,6 +3684,15 @@ def scan_symbol_options(symbol):
             "status": "EXCLUDED",
             "ignored": "symbol excluded from contract selection",
         }
+    with bot.TRADE_STATE_LOCK:
+        store = bot._load_trade_store()
+        if _symbol_alerted_today(store, symbol):
+            result = _symbol_already_alerted_result(symbol)
+            _LAST_SCAN_DECISIONS[symbol] = {
+                "status": result["status"],
+                "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
+            }
+            return result
     blocked_reason = (
         _marketdata_account_credit_limit_reason()
         if _provider_is_marketdata()
@@ -3852,16 +3910,26 @@ def scan_symbol_options(symbol):
     direction, contract, _ = max(qualified, key=lambda item: item[2])
     assessment = assessments.get(direction)
     _clear_pending_candidate(symbol)
-    state = create_trade(
-        symbol, direction, stock_price, contract=contract, gamma_info=gamma_info,
-        trade_confidence=(assessment or {}).get("trade_confidence"),
-        gamma_direction=(assessment or {}).get("gamma_direction_state"),
-        directional_edge=call_diag["edge"] if direction == "CALL" else put_diag["edge"],
-        scan_mode=scan_context["scan_mode"],
-        required_score=scan_context["required_score"],
-        required_edge=scan_context["required_edge"],
-        allow_strong_score_exception=scan_context["allow_strong_score_exception"],
-    )
+    try:
+        state = create_trade(
+            symbol, direction, stock_price, contract=contract, gamma_info=gamma_info,
+            trade_confidence=(assessment or {}).get("trade_confidence"),
+            gamma_direction=(assessment or {}).get("gamma_direction_state"),
+            directional_edge=call_diag["edge"] if direction == "CALL" else put_diag["edge"],
+            scan_mode=scan_context["scan_mode"],
+            required_score=scan_context["required_score"],
+            required_edge=scan_context["required_edge"],
+            allow_strong_score_exception=scan_context["allow_strong_score_exception"],
+        )
+    except RuntimeError as error:
+        if str(error) != "SYMBOL_ALREADY_ALERTED_TODAY":
+            raise
+        result.update(_symbol_already_alerted_result(symbol))
+        _LAST_SCAN_DECISIONS[symbol] = {
+            "status": result["status"],
+            "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
+        }
+        return result
     if state.get("_ignored_duplicate"):
         result["status"] = "DUPLICATE CONTRACT"
         result["ignored"] = "exact option contract already recorded"
