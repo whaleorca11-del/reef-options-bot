@@ -112,6 +112,7 @@ class MacdCardDeliveryTests(unittest.TestCase):
                     tempfile.TemporaryDirectory() as tmp,
                     patch.object(app.bot, "__file__", str(Path(tmp) / "template.py")),
                     patch.object(app.bot, "fetch_company_logo", return_value=None),
+                    patch.object(app.bot.ImageDraw.ImageDraw, "text", autospec=True) as text,
                 ):
                     output = app.render_trade_card(state)
                     with app.bot.Image.open(output) as image:
@@ -125,6 +126,12 @@ class MacdCardDeliveryTests(unittest.TestCase):
                             pixel == color and count > 0
                             for count, pixel in palette
                         ))
+                    calls = {call.args[2]: call for call in text.call_args_list}
+                    expected_date_color = "#008B48" if direction == "CALL" else "#DD0016"
+                    self.assertEqual(calls["OCT 23, 2026"].kwargs["fill"], expected_date_color)
+                    self.assertEqual(calls["$225.00"].kwargs["fill"], "#2788CC")
+                    self.assertEqual(calls["EXP"].kwargs["fill"], "#001338")
+                    self.assertEqual(calls["STRIKE"].kwargs["fill"], "#001338")
                     self.assertEqual(state, original)
 
     def test_monitoring_states_do_not_invent_live_prices(self):
