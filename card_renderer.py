@@ -16,7 +16,6 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
     draw = bot.ImageDraw.Draw(image)
     white, ink, muted = "#FFFFFF", "#001338", "#001338"
     cyan, green, red, yellow = "#075BCD", "#008B48", "#DD0016", "#FFCB00"
-    light_blue = "#2788CC"
     border, panel = "#CADDEC", "#EFF7FD"
 
     def coords(values):
@@ -92,7 +91,7 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
     else:
         paste_logo(image, symbol, coords((95, 100, 220, 216)))
     text(240, 95, symbol, 86, bold=True, width=266)
-    text(240, 177, contract, 45, bold=True, width=563)
+    text(240, 177, contract, 45, accent, True, 563)
     box((526, 94, 740, 163), fill=accent,
         outline=accent, radius=13)
     text(633, 108, f"{direction} {'↗' if direction == 'CALL' else '↘'}",
@@ -101,10 +100,10 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
     # Exact contract identifiers remain separate from the underlying price.
     box((89, 232, 357, 286))
     text(111, 251, "STRIKE", 20, muted, True)
-    text(340, 245, money(state["strike"]), 29, light_blue, True, 150, "right")
+    text(340, 245, money(state["strike"]), 29, bold=True, width=150, align="right")
     box((366, 232, 651, 286))
     text(387, 251, "EXP", 20, muted, True)
-    text(635, 248, expiration, 27, accent, True, 188, "right")
+    text(635, 248, expiration, 27, bold=True, width=188, align="right")
     box((661, 232, 803, 286))
     text(732, 249, f"{dte} DTE", 28, bold=True, width=124, align="center")
     box((89, 297, 803, 352))

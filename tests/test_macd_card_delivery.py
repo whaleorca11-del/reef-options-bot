@@ -127,9 +127,13 @@ class MacdCardDeliveryTests(unittest.TestCase):
                             for count, pixel in palette
                         ))
                     calls = {call.args[2]: call for call in text.call_args_list}
-                    expected_date_color = "#008B48" if direction == "CALL" else "#DD0016"
-                    self.assertEqual(calls["OCT 23, 2026"].kwargs["fill"], expected_date_color)
-                    self.assertEqual(calls["$225.00"].kwargs["fill"], "#2788CC")
+                    expected_direction_color = "#008B48" if direction == "CALL" else "#DD0016"
+                    self.assertEqual(
+                        calls[state["contract_ticker"]].kwargs["fill"],
+                        expected_direction_color,
+                    )
+                    self.assertEqual(calls["OCT 23, 2026"].kwargs["fill"], "#001338")
+                    self.assertEqual(calls["$225.00"].kwargs["fill"], "#001338")
                     self.assertEqual(calls["EXP"].kwargs["fill"], "#001338")
                     self.assertEqual(calls["STRIKE"].kwargs["fill"], "#001338")
                     self.assertEqual(state, original)
