@@ -135,8 +135,11 @@ class MacdCardDeliveryTests(unittest.TestCase):
                         calls[state["contract_ticker"]].kwargs["fill"],
                         expected_direction_color,
                     )
-                    self.assertEqual(calls["OCT 23, 2026"].kwargs["fill"], "#001338")
-                    self.assertEqual(calls["$225.00"].kwargs["fill"], "#001338")
+                    self.assertEqual(
+                        calls["OCT 23, 2026"].kwargs["fill"],
+                        expected_direction_color,
+                    )
+                    self.assertEqual(calls["$225.00"].kwargs["fill"], "#2788CC")
                     self.assertEqual(calls["EXP"].kwargs["fill"], "#001338")
                     self.assertEqual(calls["STRIKE"].kwargs["fill"], "#001338")
                     self.assertEqual(state, original)
