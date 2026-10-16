@@ -16,6 +16,7 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
     draw = bot.ImageDraw.Draw(image)
     white, ink, muted = "#FFFFFF", "#001338", "#001338"
     cyan, green, red, yellow = "#075BCD", "#008B48", "#DD0016", "#FFCB00"
+    gold = "#B68A1B"
     border, panel = "#CADDEC", "#EFF7FD"
 
     def coords(values):
@@ -74,8 +75,8 @@ def render_card(state, *, bot, gamma_values, is_tracking, paste_logo, signal_typ
     dte = bot._days_to_expiry(state["expiration"])
 
     # Brand and score.
-    mark("orca-mark.png", (89, 16, 180, 83), tint=ink)
-    text(189, 31, "ORCA", 43, bold=True)
+    mark("orca-mark.png", (89, 16, 180, 83), tint=gold)
+    text(189, 31, "ORCA", 43, gold, True)
     line((342, 30, 342, 68), ink)
     text(358, 38, "OPTIONS SIGNAL", 25, cyan, True, 225)
     box((594, 18, 803, 70), radius=9)

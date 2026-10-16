@@ -126,7 +126,10 @@ class MacdCardDeliveryTests(unittest.TestCase):
                             pixel == color and count > 0
                             for count, pixel in palette
                         ))
+                        logo_region = image.convert("RGB").crop((0, 0, 130, 105))
+                        self.assertIn((182, 138, 27), logo_region.getdata())
                     calls = {call.args[2]: call for call in text.call_args_list}
+                    self.assertEqual(calls["ORCA"].kwargs["fill"], "#B68A1B")
                     expected_direction_color = "#008B48" if direction == "CALL" else "#DD0016"
                     self.assertEqual(
                         calls[state["contract_ticker"]].kwargs["fill"],
