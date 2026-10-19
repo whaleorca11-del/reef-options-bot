@@ -18,4 +18,4 @@ services:
       - key: REEF_WEBHOOK_SECRET
         sync: false
       - key: AUTO_SCAN_ENABLED
-        value: "true"
+        value: "false"
