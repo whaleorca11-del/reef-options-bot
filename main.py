@@ -12,6 +12,7 @@ import os
 import shutil
 import threading
 import time
+import queue
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -37,7 +38,10 @@ bot.AUTO_SCAN_SECONDS = LIVE_AUTO_SCAN_INTERVAL_SECONDS
 GAMMA_DIRECTION_GATE_ENABLED = False
 LIVE_ENTRY_ALERTS_ENABLED = True
 PAPER_TESTING_ENABLED = False
-bot.ENTRY_SIGNAL_DESCRIPTION = "Live autonomous option alerts enabled; MarketData; scan starts 15 minutes after the US open, then every 15 minutes through the regular session; Gamma Flip disabled"
+bot.ENTRY_SIGNAL_DESCRIPTION = (
+    "TradingView-confirmed CALL/PUT entries only; ORCA validates and selects "
+    "option contracts; autonomous scanner disabled; Gamma Flip disabled"
+)
 
 
 def _autonomous_entry_signal_mode():
@@ -94,7 +98,9 @@ _MARKETDATA_CHAIN_FETCH_LOCK = threading.Lock()
 SCAN_IN_PROGRESS_LOCK = threading.Lock()
 CARD_RENDER_LOCK = threading.Lock()
 THREAD_START_LOCK = threading.Lock()
-_STARTED_THREADS = {"scanner": None, "monitor": None, "ichimoku": None}
+_STARTED_THREADS = {
+    "scanner": None, "monitor": None, "ichimoku": None, "tv_entry": None,
+}
 _DUPLICATE_THREAD_START_PREVENTED = False
 _LAST_SUCCESSFUL_STATE_SAVE = None
 _STATE_LOAD_STATUS = "not loaded"
@@ -103,6 +109,11 @@ _RECOVERY_REQUIRED_COUNT = 0
 _LAST_SCAN_DECISIONS = {}
 _MACD_CACHE = {}
 _MACD_CACHE_LOCK = threading.Lock()
+TV_ENTRY_QUEUE = queue.Queue(maxsize=128)
+TV_ENTRY_EVENT_TTL_SECONDS = 24 * 60 * 60
+TV_ENTRY_MAX_AGE_SECONDS = 5 * 60
+_TV_ENTRY_EVENT_CACHE = {}
+_TV_ENTRY_EVENT_CACHE_LOCK = threading.Lock()
 _SCANNER_STATUS_LOCK = threading.Lock()
 _SCANNER_STATUS = {
     "last_cycle_started": None,
@@ -947,13 +958,17 @@ def _confidence_class(value):
     return "LOW"
 
 
-def calculate_trade_confidence(contract, direction_edge, gamma_state, entry_source):
+def calculate_trade_confidence(
+    contract, direction_edge, gamma_state, entry_source,
+    external_direction_confirmed=False,
+):
     """Combine independent evidence without replacing the Phase 4 score."""
     contract_score = bot.safe_float(contract.get("score"))
     completeness = bot.safe_float(contract.get("completeness_percent"))
     edge_denominator = max(ORCA_MIN_DIRECTION_EDGE * 2.0, 1.0)
-    edge_quality = min(
-        100.0, max(0.0, direction_edge) / edge_denominator * 100.0
+    edge_quality = (
+        100.0 if external_direction_confirmed else
+        min(100.0, max(0.0, direction_edge) / edge_denominator * 100.0)
     )
     gamma_quality = {"confirmed": 100.0, "unavailable": 55.0, "opposed": 0.0}.get(
         gamma_state, 0.0
@@ -967,11 +982,14 @@ def calculate_trade_confidence(contract, direction_edge, gamma_state, entry_sour
     components = {
         "contract_score": round(contract_score * 0.45, 2),
         "data_completeness": round(completeness * 0.20, 2),
-        "direction_edge": round(edge_quality * 0.15, 2),
         "gamma_state": round(gamma_quality * 0.10, 2),
         "entry_price_quality": round(entry_quality * 0.07, 2),
         "spread_availability": round(spread_quality * 0.03, 2),
     }
+    components[
+        "external_direction_signal" if external_direction_confirmed
+        else "direction_edge"
+    ] = round(edge_quality * 0.15, 2)
     if not GAMMA_DIRECTION_GATE_ENABLED:
         # Remove the Gamma vote entirely, rather than inventing confirmation
         # or penalizing a deliberately disabled indicator as missing evidence.
@@ -987,10 +1005,10 @@ def calculate_trade_confidence(contract, direction_edge, gamma_state, entry_sour
         "components": components,
     }
 
-
 def _conservative_assessment(
     direction, contract, direction_edge, gamma_info, stock_price,
     minimum_score=None, minimum_edge=None, allow_strong_score_exception=False,
+    direction_confirmed=False,
 ):
     """Return explicit quality/price WAIT decisions for one exact candidate."""
     direction_edge = bot.safe_float(direction_edge)
@@ -1040,13 +1058,16 @@ def _conservative_assessment(
         reasons.append("WAIT - DATA INCOMPLETE")
     if bot.safe_float(contract.get("completeness_percent")) < CONSERVATIVE_MIN_COMPLETENESS:
         reasons.append("WAIT - DATA INCOMPLETE")
-    if direction_edge < edge_requirement:
+    if not direction_confirmed and direction_edge < edge_requirement:
         reasons.append("WAIT - DIRECTION UNCLEAR")
     if gamma_state == "opposed":
         reasons.append("WAIT - GAMMA OPPOSED")
     elif gamma_state == "unavailable" and (
         score < ORCA_CONSERVATIVE_MIN_SCORE + 4.0
-        or direction_edge < ORCA_MIN_DIRECTION_EDGE * 1.25
+        or (
+            not direction_confirmed
+            and direction_edge < ORCA_MIN_DIRECTION_EDGE * 1.25
+        )
         or bot.safe_float(contract.get("completeness_percent"))
         < CONSERVATIVE_MIN_COMPLETENESS
     ):
@@ -1062,7 +1083,8 @@ def _conservative_assessment(
     if REQUIRE_FRESH_OPTION_ENTRY and entry_source != "Fresh Bid/Ask Midpoint":
         reasons.append("WAIT - LIVE OPTION PRICE REQUIRED")
     confidence = calculate_trade_confidence(
-        contract, direction_edge, gamma_state, entry_source
+        contract, direction_edge, gamma_state, entry_source,
+        external_direction_confirmed=direction_confirmed,
     )
     delayed_reference_allowed = (
         entry_source == "Delayed Session Close (Reference Only)"
@@ -1080,7 +1102,6 @@ def _conservative_assessment(
         "entry_source": entry_source,
         "gamma_direction_state": gamma_state,
     }
-
 
 def _macd_contract_assessment(direction, contract, gamma_info, stock_price, minimum_score):
     """Keep contract safeguards without letting Gamma/flow vote on MACD side."""
@@ -2035,6 +2056,98 @@ def telegram_send_card(state):
                     pass
     raise RuntimeError(error_text or "Telegram send failed")
 
+
+def telegram_send_tv_signal_card(event, note=None):
+    """Send an informational TradingView card without creating a trade."""
+    token, chat_id = bot.env("TELEGRAM_BOT_TOKEN"), bot.env("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
+
+    signal_type = str(event.get("signal_type") or event.get("direction") or "").upper()
+    direction = str(event.get("direction") or "").upper()
+    is_setup = signal_type.startswith("PREPARE_")
+    symbol = str(event.get("symbol") or "UNKNOWN").upper()
+    timeframe = str(event.get("timeframe") or "—")
+    price = bot.safe_float(event.get("signal_price"))
+    price_text = f"${price:,.2f}" if price > 0 else "N/A"
+    accent = "#008B48" if direction == "CALL" else "#DD0016"
+
+    image = bot.Image.new("RGB", (1080, 680), "#F4F8FC")
+    draw = bot.ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        (35, 35, 1045, 645), radius=30, fill="#FFFFFF", outline="#CADDEC", width=3
+    )
+    draw.rounded_rectangle(
+        (35, 35, 1045, 155), radius=30, fill="#001338", outline="#001338", width=2
+    )
+    draw.text(
+        (75, 68), "GOLD ORCA  |  TRADINGVIEW",
+        font=bot._font(38, True), fill="#FFCB00",
+    )
+    draw.text(
+        (75, 190),
+        "PREPARATION SIGNAL" if is_setup else "CONFIRMED DIRECTION",
+        font=bot._font(30, True), fill="#075BCD",
+    )
+    draw.text((75, 255), direction, font=bot._font(100, True), fill=accent)
+    draw.text(
+        (75, 400), f"UNDERLYING: {symbol}",
+        font=bot._font(48, True), fill="#001338",
+    )
+    draw.text(
+        (75, 490), f"TIMEFRAME: {timeframe}    PRICE: {price_text}",
+        font=bot._font(32, True), fill="#334155",
+    )
+    footer = (
+        "SETUP ONLY - NOT A CONFIRMED ENTRY"
+        if is_setup else "DIRECTION FROM TRADINGVIEW"
+    )
+    draw.text((75, 575), footer, font=bot._font(25, True), fill="#64748B")
+
+    if is_setup:
+        caption = (
+            f"تهيئة {direction} من TradingView\n"
+            f"السهم: {symbol} | الفاصل: {timeframe} | السعر: {price_text}\n"
+            "هذه تهيئة فقط؛ ليست دخولًا مؤكدًا، ولا تنشئ صفقة أو تختار عقدًا."
+        )
+    else:
+        caption = (
+            f"إشارة مؤكدة {direction} من TradingView\n"
+            f"السهم: {symbol} | الفاصل: {timeframe} | السعر: {price_text}\n"
+            f"حالة ORCA: {str(note or 'لم يتم اعتماد عقد في هذه الدورة')[:180]}"
+        )
+
+    image_buffer = io.BytesIO()
+    image.save(image_buffer, format="PNG")
+    image_bytes = image_buffer.getvalue()
+    error_text = None
+    for attempt in range(1, TELEGRAM_SEND_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                data={"chat_id": chat_id, "caption": caption},
+                files={
+                    "photo": (
+                        "tradingview_signal.png",
+                        io.BytesIO(image_bytes),
+                        "image/png",
+                    )
+                },
+                timeout=20,
+            )
+            return _telegram_message_id(response)
+        except Exception as error:
+            error_text = str(error).replace(token, "[redacted]")
+            print(f"TradingView Telegram card attempt {attempt} failed:", error_text)
+            retryable = (
+                isinstance(error, requests.RequestException)
+                or "Telegram HTTP 429" in error_text
+                or "Telegram HTTP 5" in error_text
+            )
+            if attempt >= TELEGRAM_SEND_ATTEMPTS or not retryable:
+                raise RuntimeError(error_text) from error
+            time.sleep(TELEGRAM_EDIT_RETRY_SECONDS)
+    raise RuntimeError(error_text or "TradingView Telegram card failed")
 
 def _massive_error(response, endpoint):
     """Keep provider failures actionable without logging credentials."""
@@ -3577,7 +3690,7 @@ def _scan_mode_context(now=None):
 
 def _side_diagnostic(
     direction, side_stats, strength, other_strength, gamma_info, stock_price,
-    scan_context=None,
+    scan_context=None, direction_confirmed=False,
 ):
     scan_context = scan_context or _scan_mode_context()
     best = side_stats.get("best") or {}
@@ -3586,7 +3699,7 @@ def _side_diagnostic(
     has_eligible_contract = bool(best) and bool(best.get("selection_eligible"))
     edge = strength - other_strength
     required_score = scan_context["required_score"]
-    required_edge = scan_context["required_edge"]
+    required_edge = 0.0 if direction_confirmed else scan_context["required_edge"]
     strong_exception = (
         scan_context["allow_strong_score_exception"]
         and score >= scan_context["strong_score"]
@@ -3595,7 +3708,7 @@ def _side_diagnostic(
     score_ok = has_eligible_contract and (
         score >= required_score or strong_exception
     )
-    edge_ok = edge >= required_edge
+    edge_ok = direction_confirmed or edge >= required_edge
     volume_ok = volume >= bot.AUTO_SCAN_MIN_VOLUME
     gamma_state = gamma_direction_state(direction, stock_price, gamma_info)
     gamma_ok = gamma_state != "opposed"
@@ -3658,7 +3771,6 @@ def _side_diagnostic(
         "reason": "qualified" if accepted else "; ".join(reasons),
     }
 
-
 def _marketdata_blocked_symbol_result(symbol, reason):
     side_reason = "not evaluated: MarketData account credit limit is latched"
     return {
@@ -3674,9 +3786,14 @@ def _marketdata_blocked_symbol_result(symbol, reason):
     }
 
 
-def scan_symbol_options(symbol):
-    """Evaluate both sides without a Gamma Flip veto or MACD entry gate."""
+def scan_symbol_options(symbol, requested_direction=None):
+    """Select the best eligible contract, optionally honoring a TradingView side."""
     symbol = str(symbol or "").upper().strip()
+    requested_direction = (
+        str(requested_direction or "").upper().strip() or None
+    )
+    if requested_direction not in (None, "CALL", "PUT"):
+        raise ValueError("requested_direction must be CALL or PUT")
     if symbol in bot.EXCLUDED_SYMBOLS:
         return {
             "symbol": symbol,
@@ -3759,11 +3876,11 @@ def scan_symbol_options(symbol):
     put_strength = bot._direction_strength(put_stats, call_stats)
     call_diag = _side_diagnostic(
         "CALL", call_stats, call_strength, put_strength, gamma_info, stock_price,
-        scan_context,
+        scan_context, direction_confirmed=requested_direction == "CALL",
     )
     put_diag = _side_diagnostic(
         "PUT", put_stats, put_strength, call_strength, gamma_info, stock_price,
-        scan_context,
+        scan_context, direction_confirmed=requested_direction == "PUT",
     )
     assessments = {}
     if ORCA_CONSERVATIVE_MODE:
@@ -3776,14 +3893,19 @@ def scan_symbol_options(symbol):
             }
         assessments["CALL"] = _conservative_assessment(
             "CALL", call_stats.get("best"), call_strength - put_strength,
-            gamma_info, stock_price, **assessment_requirements,
+            gamma_info, stock_price,
+            direction_confirmed=requested_direction == "CALL",
+            **assessment_requirements,
         )
         assessments["PUT"] = _conservative_assessment(
             "PUT", put_stats.get("best"), put_strength - call_strength,
-            gamma_info, stock_price, **assessment_requirements,
+            gamma_info, stock_price,
+            direction_confirmed=requested_direction == "PUT",
+            **assessment_requirements,
         )
         ambiguous = bool(
-            call_stats.get("best") and put_stats.get("best")
+            requested_direction is None
+            and call_stats.get("best") and put_stats.get("best")
             and abs(call_strength - put_strength) < ORCA_MIN_DIRECTION_EDGE
         )
         for direction, diagnostic in (("CALL", call_diag), ("PUT", put_diag)):
@@ -3808,7 +3930,11 @@ def scan_symbol_options(symbol):
     result = {
         "symbol": symbol,
         "accepted": True,
-        "entry_signal_mode": _autonomous_entry_signal_mode(),
+        "entry_signal_mode": (
+            "TRADINGVIEW_DIRECTION"
+            if requested_direction else _autonomous_entry_signal_mode()
+        ),
+        "requested_direction": requested_direction,
         "gamma_policy": _gamma_entry_policy(),
         "scan_mode": scan_context["scan_mode"],
         "required_score": scan_context["required_score"],
@@ -3857,23 +3983,34 @@ def scan_symbol_options(symbol):
     }
 
     qualified = []
-    if call_diag["accepted"]:
+    if call_diag["accepted"] and requested_direction in (None, "CALL"):
         qualified.append(("CALL", call_stats["best"], call_strength))
-    if put_diag["accepted"]:
+    if put_diag["accepted"] and requested_direction in (None, "PUT"):
         qualified.append(("PUT", put_stats["best"], put_strength))
 
     if not qualified:
-        available = [
-            (direction, stats["best"], strength)
-            for direction, stats, strength in (
-                ("CALL", call_stats, call_strength), ("PUT", put_stats, put_strength)
-            ) if stats.get("best")
-        ]
-        if available:
-            preferred_direction, preferred_contract, _ = max(available, key=lambda item: item[2])
+        available_by_direction = {
+            "CALL": (call_stats["best"], call_strength),
+            "PUT": (put_stats["best"], put_strength),
+        }
+        if requested_direction:
+            preferred_direction = requested_direction
+            preferred_contract = available_by_direction[requested_direction][0]
         else:
-            preferred_direction = "CALL" if call_strength >= put_strength else "PUT"
-            preferred_contract = None
+            available = [
+                (direction, contract, strength)
+                for direction, (contract, strength) in available_by_direction.items()
+                if contract
+            ]
+            if available:
+                preferred_direction, preferred_contract, _ = max(
+                    available, key=lambda item: item[2]
+                )
+            else:
+                preferred_direction = (
+                    "CALL" if call_strength >= put_strength else "PUT"
+                )
+                preferred_contract = None
         assessment = assessments.get(preferred_direction)
         if (
             ORCA_CONSERVATIVE_MODE and preferred_contract and assessment
@@ -3897,7 +4034,10 @@ def scan_symbol_options(symbol):
                 assessment.get("wait_status")
                 if assessment else "WAIT - NO QUALIFIED DIRECTION"
             )
-        result["ignored"] = "neither CALL nor PUT qualified"
+        result["ignored"] = (
+            f"requested {requested_direction} did not qualify"
+            if requested_direction else "neither CALL nor PUT qualified"
+        )
         _LAST_SCAN_DECISIONS[symbol] = {
             "status": result["status"],
             "preferred_contract": result.get("preferred_contract"),
@@ -3918,8 +4058,11 @@ def scan_symbol_options(symbol):
             directional_edge=call_diag["edge"] if direction == "CALL" else put_diag["edge"],
             scan_mode=scan_context["scan_mode"],
             required_score=scan_context["required_score"],
-            required_edge=scan_context["required_edge"],
+            required_edge=(
+                0.0 if requested_direction else scan_context["required_edge"]
+            ),
             allow_strong_score_exception=scan_context["allow_strong_score_exception"],
+            external_direction_confirmed=bool(requested_direction),
         )
     except RuntimeError as error:
         if str(error) != "SYMBOL_ALREADY_ALERTED_TODAY":
@@ -3949,7 +4092,6 @@ def scan_symbol_options(symbol):
         "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
     }
     return result
-
 
 def _scan_decision_summary(diagnostic):
     """Keep health/log output complete without dumping every candidate row."""
@@ -4540,6 +4682,342 @@ def _normalize_tradingview_payload(path, payload):
     return normalized
 
 
+def _parse_tv_entry_signal(payload, now=None):
+    """Validate a fresh TradingView setup or confirmed-direction signal."""
+    if not isinstance(payload, dict):
+        raise ValueError("JSON object required")
+
+    symbol = _tradingview_symbol(payload.get("ticker") or payload.get("symbol"))
+    direction = _tradingview_direction(payload)
+    signal_type = _tradingview_signal_type(payload) or direction
+    timeframe = str(payload.get("timeframe") or "").strip()
+    raw_bar_close = payload.get("bar_close_time_ms")
+
+    if not symbol or symbol not in bot.WATCHLIST:
+        raise ValueError("ticker is not in the ORCA watchlist")
+    if symbol in bot.EXCLUDED_SYMBOLS:
+        raise ValueError("ticker is excluded from ORCA contract selection")
+    if direction not in ("CALL", "PUT"):
+        raise ValueError("direction must be CALL or PUT")
+    if signal_type not in ("CALL", "PUT", "PREPARE_CALL", "PREPARE_PUT"):
+        raise ValueError("signal_type must be CALL, PUT, PREPARE_CALL, or PREPARE_PUT")
+    expected_direction = (
+        signal_type[len("PREPARE_"):]
+        if signal_type.startswith("PREPARE_")
+        else signal_type
+    )
+    if direction != expected_direction:
+        raise ValueError("direction does not match signal_type")
+    if not timeframe or len(timeframe) > 12:
+        raise ValueError("valid chart timeframe required")
+    if isinstance(raw_bar_close, bool) or raw_bar_close is None:
+        raise ValueError("bar_close_time_ms required")
+    try:
+        bar_close_time_ms = int(float(raw_bar_close))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("bar_close_time_ms must be milliseconds") from error
+    if bar_close_time_ms <= 0:
+        raise ValueError("bar_close_time_ms must be positive")
+
+    now = now or bot.now_new_york()
+    age_seconds = now.timestamp() - bar_close_time_ms / 1000.0
+    if age_seconds < -30 or age_seconds > TV_ENTRY_MAX_AGE_SECONDS:
+        raise ValueError("TradingView signal is stale or has a future bar time")
+
+    event_id = f"{symbol}|{timeframe}|{signal_type}|{bar_close_time_ms}"
+    return {
+        "event_id": event_id,
+        "symbol": symbol,
+        "direction": direction,
+        "signal_type": signal_type,
+        "event_kind": (
+            "PREPARATION" if signal_type.startswith("PREPARE_") else "ENTRY"
+        ),
+        "timeframe": timeframe,
+        "bar_close_time_ms": bar_close_time_ms,
+        "signal_price": payload.get("signal_price"),
+        "received_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _queue_tv_entry_signal(event):
+    """Enqueue one event id once, keeping the webhook response fast."""
+    now = time.monotonic()
+    with _TV_ENTRY_EVENT_CACHE_LOCK:
+        expired = [
+            event_id for event_id, record in _TV_ENTRY_EVENT_CACHE.items()
+            if now - record["queued_monotonic"] > TV_ENTRY_EVENT_TTL_SECONDS
+        ]
+        for event_id in expired:
+            _TV_ENTRY_EVENT_CACHE.pop(event_id, None)
+
+        event_id = event["event_id"]
+        if event_id in _TV_ENTRY_EVENT_CACHE:
+            return False
+        if TV_ENTRY_QUEUE.full():
+            raise queue.Full
+
+        with bot.TRADE_STATE_LOCK:
+            store = bot._load_trade_store()
+            persisted_events = store.get("tv_entry_events")
+            if persisted_events is None:
+                persisted_events = store["tv_entry_events"] = {}
+            if not isinstance(persisted_events, dict):
+                raise TradeStateCorruptionError(
+                    "persisted TradingView event history is not an object"
+                )
+            if event_id in persisted_events:
+                _TV_ENTRY_EVENT_CACHE[event_id] = {
+                    "status": persisted_events[event_id].get("status", "queued"),
+                    "queued_monotonic": now,
+                    "symbol": event["symbol"],
+                    "direction": event["direction"],
+                    "signal_type": event.get("signal_type", event["direction"]),
+                }
+                return False
+
+            cutoff = bot.now_new_york().timestamp() - TV_ENTRY_EVENT_TTL_SECONDS
+            for old_id, old_event in list(persisted_events.items()):
+                if not isinstance(old_event, dict):
+                    persisted_events.pop(old_id, None)
+                    continue
+                try:
+                    old_time = bot.datetime.fromisoformat(
+                        old_event.get("received_at", "")
+                    ).timestamp()
+                except (AttributeError, TypeError, ValueError):
+                    old_time = 0
+                if old_time < cutoff:
+                    persisted_events.pop(old_id, None)
+
+            persisted_events[event_id] = {
+                **event,
+                "status": "queued",
+            }
+            bot._save_trade_store(store)
+
+        _TV_ENTRY_EVENT_CACHE[event_id] = {
+            "status": "queued",
+            "queued_monotonic": now,
+            "symbol": event["symbol"],
+            "direction": event["direction"],
+            "signal_type": event.get("signal_type", event["direction"]),
+        }
+        try:
+            TV_ENTRY_QUEUE.put_nowait(dict(event))
+        except queue.Full:
+            _TV_ENTRY_EVENT_CACHE.pop(event_id, None)
+            raise
+        return True
+
+
+def _set_tv_entry_event_status(event, status, result=None):
+    event_id = event["event_id"]
+    summary = {
+        "status": str(status),
+        "contract": (result or {}).get("contract"),
+        "signal_type": event.get("signal_type", event.get("direction")),
+        "telegram_message_id": (
+            (result or {}).get("message_id")
+            or (result or {}).get("signal_notification_message_id")
+        ),
+        "updated_at": bot.now_new_york().isoformat(timespec="seconds"),
+    }
+    with _TV_ENTRY_EVENT_CACHE_LOCK:
+        record = _TV_ENTRY_EVENT_CACHE.get(event_id)
+        if record:
+            record.update(summary)
+    with bot.TRADE_STATE_LOCK:
+        store = bot._load_trade_store()
+        persisted = (store.get("tv_entry_events") or {}).get(event_id)
+        if isinstance(persisted, dict):
+            persisted.update(summary)
+            bot._save_trade_store(store)
+
+
+def process_tv_entry_signal(event):
+    """Deliver preparation notices or run the confirmed-side contract pipeline."""
+    now = bot.now_new_york()
+    try:
+        age_seconds = now.timestamp() - (
+            int(event["bar_close_time_ms"]) / 1000.0
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        age_seconds = TV_ENTRY_MAX_AGE_SECONDS + 1
+    if age_seconds < -30 or age_seconds > TV_ENTRY_MAX_AGE_SECONDS:
+        _set_tv_entry_event_status(event, "EXPIRED")
+        return {
+            "symbol": event.get("symbol"),
+            "direction": event.get("direction"),
+            "status": "EXPIRED",
+        }
+
+    signal_type = str(
+        event.get("signal_type") or event.get("direction") or ""
+    ).upper()
+    event_kind = event.get("event_kind") or (
+        "PREPARATION" if signal_type.startswith("PREPARE_") else "ENTRY"
+    )
+    if event_kind == "PREPARATION":
+        message_id = telegram_send_tv_signal_card(event)
+        result = {
+            "symbol": event["symbol"],
+            "direction": event["direction"],
+            "signal_type": signal_type,
+            "status": "PREPARATION_SENT",
+            "message_id": message_id,
+            "trade_created": False,
+        }
+        _set_tv_entry_event_status(event, result["status"], result=result)
+        print(
+            "TradingView preparation delivered:",
+            event["symbol"], signal_type, event.get("timeframe", ""),
+        )
+        return result
+
+    if not bot.market_is_open_now(now):
+        note = "السوق مغلق؛ لم يتم فحص أو اختيار عقد"
+        message_id = telegram_send_tv_signal_card(event, note=note)
+        result = {
+            "symbol": event["symbol"],
+            "direction": event["direction"],
+            "signal_type": signal_type,
+            "status": "MARKET_CLOSED",
+            "message_id": message_id,
+            "trade_created": False,
+        }
+        _set_tv_entry_event_status(event, result["status"], result=result)
+        return result
+    if not LIVE_ENTRY_ALERTS_ENABLED:
+        note = "تنبيهات الدخول متوقفة؛ لم يتم فحص أو اختيار عقد"
+        message_id = telegram_send_tv_signal_card(event, note=note)
+        result = {
+            "symbol": event["symbol"],
+            "direction": event["direction"],
+            "signal_type": signal_type,
+            "status": "ENTRY_PAUSED",
+            "message_id": message_id,
+            "trade_created": False,
+        }
+        _set_tv_entry_event_status(event, result["status"], result=result)
+        return result
+    _set_tv_entry_event_status(event, "processing")
+    try:
+        result = scan_symbol_options(
+            event["symbol"], requested_direction=event["direction"]
+        )
+    except Exception as error:
+        print(
+            "TradingView contract scan failed:",
+            event.get("symbol"), type(error).__name__,
+        )
+        note = "تعذر فحص العقود؛ لم يتم اعتماد أو إرسال عقد"
+        message_id = telegram_send_tv_signal_card(event, note=note)
+        result = {
+            "status": "CONTRACT_SCAN_ERROR",
+            "reason": note,
+            "signal_notification_message_id": message_id,
+        }
+    if not isinstance(result, dict):
+        result = {
+            "status": "CONTRACT_SCAN_ERROR",
+            "reason": "تعذر قراءة نتيجة فحص العقود",
+        }
+    if str(result.get("status") or "").upper() != "TRADE":
+        if not result.get("signal_notification_message_id"):
+            message_id = telegram_send_tv_signal_card(
+                event,
+                note=result.get("reason") or result.get("status")
+                or "لم يتم اعتماد عقد في هذه الدورة",
+            )
+            result["signal_notification_message_id"] = message_id
+    _set_tv_entry_event_status(
+        event, result.get("status") or "processed", result=result
+    )
+    print(
+        "TradingView direction processed:",
+        event["symbol"], event["direction"],
+        result.get("status"), result.get("contract") or "",
+    )
+    return result
+
+
+def recover_tv_entry_queue():
+    """Requeue recently accepted webhooks that were interrupted by a restart."""
+    now = bot.now_new_york()
+    recovered = []
+    with bot.TRADE_STATE_LOCK:
+        store = bot._load_trade_store()
+        events = store.get("tv_entry_events")
+        if events is None:
+            events = {}
+        if not isinstance(events, dict):
+            raise TradeStateCorruptionError(
+                "persisted TradingView event history is not an object"
+            )
+        changed = False
+        for event_id, record in events.items():
+            if not isinstance(record, dict) or record.get("status") not in (
+                "queued", "processing",
+            ):
+                continue
+            try:
+                age = now.timestamp() - (
+                    int(record["bar_close_time_ms"]) / 1000.0
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                age = TV_ENTRY_MAX_AGE_SECONDS + 1
+            if age < -30 or age > TV_ENTRY_MAX_AGE_SECONDS:
+                record["status"] = "expired"
+                record["updated_at"] = now.isoformat(timespec="seconds")
+                changed = True
+                continue
+            if len(recovered) < TV_ENTRY_QUEUE.maxsize:
+                record["status"] = "queued"
+                record["updated_at"] = now.isoformat(timespec="seconds")
+                recovered.append({
+                    key: record[key]
+                    for key in (
+                        "event_id", "symbol", "direction", "signal_type",
+                        "event_kind", "timeframe",
+                        "bar_close_time_ms", "signal_price", "received_at",
+                    )
+                    if key in record
+                })
+                changed = True
+        if changed:
+            bot._save_trade_store(store)
+
+    for event in recovered:
+        _TV_ENTRY_EVENT_CACHE[event["event_id"]] = {
+            "status": "queued",
+            "queued_monotonic": time.monotonic(),
+            "symbol": event["symbol"],
+            "direction": event["direction"],
+            "signal_type": event.get("signal_type", event["direction"]),
+        }
+        TV_ENTRY_QUEUE.put_nowait(event)
+    return len(recovered)
+
+
+def tradingview_entry_worker_loop():
+    """Process webhook signals outside TradingView's short request timeout."""
+    while True:
+        event = TV_ENTRY_QUEUE.get()
+        try:
+            process_tv_entry_signal(event)
+        except Exception as error:
+            try:
+                _set_tv_entry_event_status(event, "ERROR")
+            except Exception as state_error:
+                print("TradingView event state update failed:", str(state_error))
+            print(
+                "TradingView direction processing failed:",
+                event.get("symbol"), event.get("direction"), str(error),
+            )
+        finally:
+            TV_ENTRY_QUEUE.task_done()
+
 def _start_thread_once(kind, target, name):
     """Prevent duplicate in-process loops when startup is invoked twice."""
     global _DUPLICATE_THREAD_START_PREVENTED
@@ -4847,6 +5325,76 @@ class CanonicalHandler(bot.Handler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/tv-entry-signal":
+            secret = bot.env("REEF_WEBHOOK_SECRET")
+            if not secret:
+                self.json_response(503, {
+                    "accepted": False,
+                    "error": "webhook authentication is not configured",
+                })
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 16384:
+                    raise ValueError("bounded JSON object required")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON object required")
+            except (ValueError, UnicodeDecodeError):
+                self.json_response(400, {
+                    "accepted": False,
+                    "error": "valid bounded JSON object required",
+                })
+                return
+
+            if not hmac.compare_digest(
+                str(payload.get("secret", "")).encode("utf-8"),
+                secret.encode("utf-8"),
+            ):
+                self.json_response(401, {
+                    "accepted": False,
+                    "error": "invalid secret",
+                })
+                return
+
+            try:
+                event = _parse_tv_entry_signal(payload)
+            except ValueError as error:
+                self.json_response(422, {
+                    "accepted": False,
+                    "error": str(error),
+                })
+                return
+
+            try:
+                queued = _queue_tv_entry_signal(event)
+            except queue.Full:
+                self.json_response(503, {
+                    "accepted": False,
+                    "error": "TradingView signal queue is full; retry this event",
+                })
+                return
+            except Exception as error:
+                print("TradingView signal queue failed:", str(error))
+                self.json_response(503, {
+                    "accepted": False,
+                    "error": "could not safely queue TradingView signal",
+                })
+                return
+
+            self.json_response(202, {
+                "accepted": True,
+                "queued": queued,
+                "duplicate": not queued,
+                "symbol": event["symbol"],
+                "direction": event["direction"],
+                "signal_type": event["signal_type"],
+                "event_kind": event["event_kind"],
+                "event_id": event["event_id"],
+            })
+            return
+
         if path == "/paper-signal":
             if not PAPER_TESTING_ENABLED:
                 self.json_response(410, {
@@ -5094,6 +5642,12 @@ def main():
     except TradeStateCorruptionError as error:
         print("FATAL durable trade-state recovery error:", error)
         return
+    recovered_tv_events = recover_tv_entry_queue()
+    if recovered_tv_events:
+        print("Recovered pending TradingView entry signals:", recovered_tv_events)
+    _start_thread_once(
+        "tv_entry", tradingview_entry_worker_loop, "orca-tv-entry-worker"
+    )
     if PAPER_TESTING_ENABLED:
         _PAPER_OPTIONS.start()
     else:

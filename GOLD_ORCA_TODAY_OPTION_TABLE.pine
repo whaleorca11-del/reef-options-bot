@@ -1,0 +1,1022 @@
+//@version=6
+indicator("GOLD ORCA — عقد اليوم المستقل", shorttitle="GOLD ORCA 0DTE", overlay=true, max_labels_count=500, dynamic_requests=true)
+// ═════════════ إعدادات الغيمة ═════════════
+fastLength = input.int(9, "EMA السريع", minval=1, group="الغيمة")
+slowLength = input.int(21, "EMA البطيء", minval=2, group="الغيمة")
+showCloud = input.bool(true, "إظهار الغيمة", group="الغيمة")
+showSetupLevel = input.bool(true, "إظهار مستوى تأكيد التهيئة", group="الغيمة")
+// ═════════════ إعدادات VWAP ═════════════
+// الحساب من شموع الشارت داخل الجلسة المحددة فقط.
+showVwap = input.bool(true, "إظهار VWAP", group="VWAP")
+useVwapFilter = input.bool(true, "تفعيل فلتر موقع السعر من VWAP", group="VWAP")
+useVwapSlope = input.bool(false, "اشتراط ميل VWAP أيضًا", group="VWAP")
+slopeBars = input.int(3, "عدد شموع قياس الميل", minval=1, group="VWAP")
+sessionHours = input.session("0930-1600", "جلسة حساب VWAP", group="VWAP")
+sessionTimezone = input.string("America/New_York", "المنطقة الزمنية للجلسة", group="VWAP")
+regularSessionOnly = input.bool(true, "الإشارات داخل الجلسة المحددة فقط", group="VWAP")
+// ═════════════ إعدادات الإشارات ═════════════
+showPrepare = input.bool(true, "إظهار علامات التهيئة", group="الإشارات")
+showSignals = input.bool(true, "إظهار CALL وPUT", group="الإشارات")
+breakMode = input.string(
+     "الإغلاق",
+     "طريقة تأكيد كسر شمعة التهيئة",
+     options=["الإغلاق", "الذيل"],
+     group="الإشارات",
+     tooltip="كلا الوضعين ينتظر إغلاق الشمعة. وضع الذيل يقبل تجاوز أعلى/أدنى الشمعة للمستوى، بشرط بقاء الإغلاق خارج الغيمة.")
+setupMaxBars = input.int(
+     0,
+     "صلاحية التهيئة بالشموع — صفر دون حد",
+     minval=0,
+     group="الإشارات")
+// ═════════════ ربط تنبيهات هذا المؤشر مع ORCA عبر TradingView ═════════════
+sendOrcaAlerts = input.bool(
+     false,
+     "إرسال CALL وPUT والتهيئة إلى بوت ORCA",
+     confirm=true,
+     group="ربط ORCA عبر TradingView")
+webhookSecret = input.text_area(
+     "",
+     "سر الربط — REEF_WEBHOOK_SECRET",
+     confirm=true,
+     display=display.none,
+     group="ربط ORCA عبر TradingView")
+webhookSecretReady = str.length(str.trim(webhookSecret)) > 0
+// ═════════════ خروج بكسر آخر شمعة اتجاه ═════════════
+useWeakExit = input.bool(true, "تفعيل الخروج بكسر آخر شمعة اتجاه", group="الخروج")
+exitReference = input.string("الذيل", "مستوى الشمعة المرجعية للخروج", options=["الذيل", "الجسم"], group="الخروج", tooltip="PUT: الذيل = أعلى الشمعة الهابطة، الجسم = أعلى جسمها. CALL: الذيل = أدنى الشمعة الصاعدة، الجسم = أدنى جسمها. التأكيد بإغلاق شمعة لاحقة خلف المستوى، وليس بمجرد لمس الذيل.")
+showExitSignals = input.bool(true, "إظهار علامات الخروج", group="الخروج")
+showWeakLevel = input.bool(false, "إظهار مستوى تأكيد الخروج", group="الخروج")
+exitColor = input.color(color.fuchsia, "لون الخروج الفني", group="الخروج")
+// ═════════════ مستويات السهم ═════════════
+stopTicks = input.int(1, "هامش الوقف خارج شمعة التهيئة — تكات", minval=1, group="المستويات")
+target1R = input.float(1.0, "الهدف الأول — مضاعف المخاطرة", minval=0.1, step=0.1, group="المستويات")
+target2R = input.float(2.0, "الهدف الثاني — مضاعف المخاطرة", minval=0.1, step=0.1, group="المستويات")
+// ═════════════ الجدول ═════════════
+showTable = input.bool(true, "إظهار الجدول", group="الجدول")
+tableLocation = input.string(
+     "أعلى اليمين",
+     "مكان الجدول",
+     options=["أعلى اليمين", "أسفل اليمين", "أعلى اليسار", "أسفل اليسار"],
+     group="الجدول")
+fontChoice = input.string(
+     "عادي",
+     "حجم الكتابة",
+     options=["صغير", "عادي", "كبير"],
+     group="الجدول")
+textColor = input.color(color.white, "لون كتابة الجدول", group="الألوان")
+backgroundColor = input.color(color.rgb(20, 25, 40), "خلفية الجدول", group="الألوان")
+headerColor = input.color(color.rgb(207, 167, 45), "خلفية العنوان", group="الألوان")
+waitColor = input.color(color.orange, "الانتظار", group="الألوان")
+prepColor = input.color(color.aqua, "التهيئة", group="الألوان")
+callColor = input.color(color.rgb(30, 150, 110), "CALL", group="الألوان")
+putColor = input.color(color.red, "PUT", group="الألوان")
+fastColor = input.color(color.aqua, "EMA السريع", group="الألوان")
+slowColor = input.color(color.orange, "EMA البطيء", group="الألوان")
+vwapColor = input.color(color.yellow, "VWAP", group="الألوان")
+stopCellColor = input.color(color.rgb(125, 35, 45), "خلفية وقف السهم", group="الألوان")
+t1CellColor = input.color(color.rgb(25, 90, 100), "خلفية الهدف الأول", group="الألوان")
+t2CellColor = input.color(color.rgb(75, 55, 125), "خلفية الهدف الثاني", group="الألوان")
+vwapCellColor = input.color(color.rgb(120, 95, 25), "خلفية VWAP", group="الألوان")
+lampOnColor = input.color(color.lime, "لمبة وصل — مضاءة", group="الألوان")
+lampOffColor = input.color(color.rgb(55, 55, 55), "لمبة وصل — مطفأة", group="الألوان")
+royalBlue = input.color(color.rgb(30, 60, 165), "أزرق الأقسام", group="الألوان")
+// ═════════════ متابعة ست شركات إضافية ═════════════
+showWatchlist = input.bool(true, "إظهار الشركات الست أسفل الجدول", group="الشركات الست")
+watch1 = input.symbol("NASDAQ:AAPL", "الشركة 1", group="الشركات الست")
+watch2 = input.symbol("NASDAQ:NVDA", "الشركة 2", group="الشركات الست")
+watch3 = input.symbol("NASDAQ:AMZN", "الشركة 3", group="الشركات الست")
+watch4 = input.symbol("NASDAQ:TSLA", "الشركة 4", group="الشركات الست")
+watch5 = input.symbol("NASDAQ:META", "الشركة 5", group="الشركات الست")
+watch6 = input.symbol("NASDAQ:MSFT", "الشركة 6", group="الشركات الست")
+showOptionDataTest = input.bool(true, "إظهار فحص جلب بيانات العقد", group="فحص بيانات العقد")
+optionDataTestSide = input.string("CALL", "اتجاه عقد الاختبار", options=["CALL", "PUT"], group="فحص بيانات العقد")
+optionDataTestStrike = input.float(0.0, "سترايك الاختبار — صفر لاختيار الأقرب", minval=0.0, step=0.5, group="فحص بيانات العقد")
+
+// ═════════════ المتوسطات ═════════════
+emaFast = ta.ema(close, fastLength)
+emaSlow = ta.ema(close, slowLength)
+cloudTop = math.max(emaFast, emaSlow)
+cloudBottom = math.min(emaFast, emaSlow)
+crossUp = ta.crossover(close, cloudTop)
+crossDown = ta.crossunder(close, cloudBottom)
+historyReady = not na(cloudTop[1]) and not na(cloudBottom[1])
+chartSupported = timeframe.isintraday and chart.is_standard
+// ═════════════ VWAP الجلسة ═════════════
+inSession = timeframe.isintraday and not na(time(timeframe.period, sessionHours, sessionTimezone))
+localDate = year(time, sessionTimezone) * 10000 +
+     month(time, sessionTimezone) * 100 +
+     dayofmonth(time, sessionTimezone)
+OPTION_TZ = "America/New_York"
+optionTodayDateKey = year(timenow, OPTION_TZ) * 10000 +
+     month(timenow, OPTION_TZ) * 100 +
+     dayofmonth(timenow, OPTION_TZ)
+optionTodayWeekday = dayofweek(timenow, OPTION_TZ) != dayofweek.saturday and
+     dayofweek(timenow, OPTION_TZ) != dayofweek.sunday
+
+f_two_digits(int value) =>
+    value < 10 ? "0" + str.tostring(value) : str.tostring(value)
+
+f_option_date_key(int timestampValue) =>
+    year(timestampValue, OPTION_TZ) * 10000 +
+     month(timestampValue, OPTION_TZ) * 100 +
+     dayofmonth(timestampValue, OPTION_TZ)
+
+f_option_ticker(float strike, int direction, int dateKey) =>
+    int yearPart = int(math.floor(dateKey / 10000.0)) % 100
+    int monthPart = int(math.floor(dateKey / 100.0)) % 100
+    int dayPart = dateKey % 100
+    int strikeMilli = int(math.round(strike * 1000.0))
+    "O:" + syminfo.ticker +
+     f_two_digits(yearPart) + f_two_digits(monthPart) + f_two_digits(dayPart) +
+     (direction == 1 ? "C" : "P") + str.tostring(strikeMilli, "00000000")
+
+f_round_to_step(float value, float step) =>
+    math.round(value / step) * step
+
+f_option_quote(string symbol) =>
+    float result = na
+    if symbol != syminfo.tickerid and (barstate.islastconfirmedhistory or barstate.isrealtime)
+        result := request.security(symbol, timeframe.period, close, gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    result
+
+f_option_test_data(string symbol) =>
+    request.security(
+         symbol, timeframe.period, [close, time],
+         gaps=barmerge.gaps_off,
+         lookahead=barmerge.lookahead_off,
+         ignore_invalid_symbol=true)
+
+newDate = na(localDate[1]) or localDate != localDate[1]
+newSession = inSession and (not inSession[1] or newDate)
+sessionStartHour = int(str.tonumber(str.substring(sessionHours, 0, 2)))
+sessionStartMinute = int(str.tonumber(str.substring(sessionHours, 2, 4)))
+atSessionStart = hour(time, sessionTimezone) == sessionStartHour and
+     minute(time, sessionTimezone) == sessionStartMinute
+var float cumulativePV = 0.0
+var float cumulativeVolume = 0.0
+var bool sessionDataValid = false
+var int sessionBarCount = 0
+if newSession
+    cumulativePV := 0.0
+    cumulativeVolume := 0.0
+    sessionDataValid := atSessionStart
+    sessionBarCount := 0
+if inSession
+    sessionBarCount += 1
+    // لا نعرض VWAP كامل الجلسة إذا كانت بياناتها ناقصة.
+    if not newSession and time > time_close[1]
+        sessionDataValid := false
+    if na(volume) or volume < 0
+        sessionDataValid := false
+    else
+        cumulativePV += hlc3 * volume
+        cumulativeVolume += volume
+vwapLine = inSession and sessionDataValid and cumulativeVolume > 0 ?
+     cumulativePV / cumulativeVolume : na
+vwapAvailable = not na(vwapLine)
+slopeReady = vwapAvailable and sessionBarCount > slopeBars and
+     not na(vwapLine[slopeBars])
+vwapRising = slopeReady and vwapLine > vwapLine[slopeBars]
+vwapFalling = slopeReady and vwapLine < vwapLine[slopeBars]
+// تشغيل شرط الميل يفعّل شرط موقع السعر أيضًا.
+vwapGateEnabled = useVwapFilter or useVwapSlope
+callVwapPass = not vwapGateEnabled or
+     (vwapAvailable and close > vwapLine and (not useVwapSlope or vwapRising))
+putVwapPass = not vwapGateEnabled or
+     (vwapAvailable and close < vwapLine and (not useVwapSlope or vwapFalling))
+signalSessionPass = not regularSessionOnly or inSession
+// ═════════════ التهيئة مستقلة عن متابعة الإشارة السابقة ═════════════
+var int setupDirection = 0
+var int setupBar = na
+var float setupHigh = na
+var float setupLow = na
+var string opportunityText = "انتظار تهيئة جديدة"
+var string opportunityReason = "اختراق الغيمة أو كسرها أولًا"
+var color opportunityColor = color.orange
+bool prepareCall = false
+bool preparePut = false
+bool callSignal = false
+bool putSignal = false
+float newSignalStop = na
+float newSignalEntry = na
+buffer = stopTicks * syminfo.mintick
+secondR = math.max(target1R, target2R)
+// ═════════════ متابعة آخر إشارة فقط ═════════════
+var int trackedDirection = 0
+var int lastDirection = 0
+var int trackedEntryBar = na
+var float trackedEntry = na
+var float trackedStop = na
+var float trackedTarget1 = na
+var float trackedTarget2 = na
+var int optionSignalDirection = 0
+var int optionSignalDate = na
+var float optionSignalUnderlyingPrice = na
+var float optionRequestAnchor = na
+var string trackingText = "لا توجد إشارة سابقة"
+var color trackingColor = color.orange
+var bool firstTargetReached = false
+var bool secondTargetReached = false
+var int weakBar = na
+var float weakLevel = na
+bool weakCall = false
+bool weakPut = false
+bool exitCall = false
+bool exitPut = false
+bool stopCall = false
+bool stopPut = false
+if barstate.islastconfirmedhistory
+    optionRequestAnchor := close
+// ═════════════ معالجة الشموع المغلقة ═════════════
+if barstate.isconfirmed and historyReady
+    // متابعة آخر إشارة لا تتحكم في السماح بالإشارات الجديدة.
+    if trackedDirection != 0 and bar_index > trackedEntryBar
+        bool touchedStop = trackedDirection == 1 ? low <= trackedStop : high >= trackedStop
+        bool touchedT1 = trackedDirection == 1 ? high >= trackedTarget1 : low <= trackedTarget1
+        bool touchedT2 = trackedDirection == 1 ? high >= trackedTarget2 : low <= trackedTarget2
+        if touchedStop
+            stopCall := trackedDirection == 1
+            stopPut := trackedDirection == -1
+            bool ambiguousTouch = touchedT2 or (touchedT1 and not firstTargetReached)
+            if ambiguousTouch
+                trackingText := "وقف وهدف بنفس الشمعة — الترتيب مجهول"
+                trackingColor := waitColor
+            else
+                trackingText := "وصل مستوى الوقف"
+                trackingColor := putColor
+            trackedDirection := 0
+        else if touchedT2 and not secondTargetReached
+            secondTargetReached := true
+            firstTargetReached := true
+            trackingText := useWeakExit ? "وصل الهدف الثاني — متابعة الخروج الفني" : "وصل الهدف الثاني"
+            trackingColor := callColor
+            if not useWeakExit
+                trackedDirection := 0
+        else if touchedT1 and not firstTargetReached
+            firstTargetReached := true
+            trackingText := "وصل الهدف الأول — متابعة الثاني"
+            trackingColor := callColor
+    // CALL: قاع أحدث شمعة صاعدة. PUT: قمة أحدث شمعة هابطة.
+    // نفحص المرجع السابق قبل تحديثه؛ الشمعة الحالية لا تؤكد كسر نفسها.
+    if useWeakExit and trackedDirection != 0 and bar_index > trackedEntryBar
+        bool broken = not na(weakBar) and bar_index > weakBar and (trackedDirection == 1 ? close < weakLevel : close > weakLevel)
+        if broken
+            exitCall := trackedDirection == 1
+            exitPut := trackedDirection == -1
+            trackingText := exitCall ? "احجز ربحك — خروج CALL" : "احجز ربحك — خروج PUT"
+            trackingColor := exitColor
+            trackedDirection := 0
+        else if (trackedDirection == 1 ? close > open : close < open)
+            weakBar := bar_index
+            weakLevel := trackedDirection == 1 ? (exitReference == "الذيل" ? low : math.min(open, close)) : (exitReference == "الذيل" ? high : math.max(open, close))
+    if trackedDirection == 0
+        weakBar := na
+        weakLevel := na
+    opportunityText := "انتظار تهيئة جديدة"
+    opportunityReason := "اختراق الغيمة أو كسرها أولًا"
+    opportunityColor := waitColor
+    // لا تمتد تهيئة الجلسة الماضية إلى جلسة جديدة.
+    if newSession or (regularSessionOnly and not inSession)
+        setupDirection := 0
+        setupBar := na
+        setupHigh := na
+        setupLow := na
+    if not chartSupported
+        opportunityText := "الشارت غير مناسب"
+        opportunityReason := "استخدم شموعًا عادية وفاصلًا لحظيًا"
+    else if not signalSessionPass
+        opportunityText := "خارج جلسة الإشارات"
+        opportunityReason := "انتظار الجلسة المحددة"
+    else
+        // أولًا: فحص شمعة تهيئة سابقة.
+        if setupDirection != 0 and bar_index > setupBar
+            bool expired = setupMaxBars > 0 and bar_index - setupBar > setupMaxBars
+            bool cancelled = setupDirection == 1 ? close <= cloudTop : close >= cloudBottom
+            bool levelBroken = setupDirection == 1 ?
+                 (breakMode == "الإغلاق" ? close > setupHigh : high > setupHigh) :
+                 (breakMode == "الإغلاق" ? close < setupLow : low < setupLow)
+            bool filterPassed = setupDirection == 1 ? callVwapPass : putVwapPass
+            if expired or cancelled
+                opportunityText := expired ? "انتهت صلاحية التهيئة" : "أُلغيت التهيئة"
+                opportunityReason := expired ? "انتظار اختراق جديد" : "رجع الإغلاق داخل الغيمة أو تجاوزها عكسيًا"
+                setupDirection := 0
+            else if levelBroken and filterPassed
+                float candidateStop = setupDirection == 1 ? setupLow - buffer : setupHigh + buffer
+                float candidateRisk = setupDirection == 1 ? close - candidateStop : candidateStop - close
+                if candidateRisk > 0
+                    callSignal := setupDirection == 1
+                    putSignal := setupDirection == -1
+                    newSignalEntry := close
+                    newSignalStop := candidateStop
+                    opportunityText := callSignal ? "CALL — إشارة جديدة" : "PUT — إشارة جديدة"
+                    opportunityReason := "تأكد كسر شمعة التهيئة واجتازت الفلاتر"
+                    opportunityColor := callSignal ? callColor : putColor
+                    setupDirection := 0
+            else
+                opportunityText := setupDirection == 1 ? "تهيئة CALL" : "تهيئة PUT"
+                opportunityColor := prepColor
+                if not levelBroken
+                    opportunityReason := setupDirection == 1 ? "انتظار اختراق قمة شمعة التهيئة" : "انتظار كسر قاع شمعة التهيئة"
+                else if not vwapAvailable
+                    opportunityReason := "VWAP غير متاح أو بيانات الجلسة ناقصة"
+                else if setupDirection == 1 and close <= vwapLine
+                    opportunityReason := "الكسر تحقق لكن الإغلاق ليس فوق VWAP"
+                else if setupDirection == -1 and close >= vwapLine
+                    opportunityReason := "الكسر تحقق لكن الإغلاق ليس تحت VWAP"
+                else
+                    opportunityReason := "انتظار توافق ميل VWAP"
+        if setupDirection == 0
+            setupBar := na
+            setupHigh := na
+            setupLow := na
+        // ثانيًا: تسجيل تهيئة جديدة.
+        // لا دخول على شمعة التهيئة نفسها.
+        if not callSignal and not putSignal
+            if crossUp or crossDown
+                setupDirection := crossUp ? 1 : -1
+                setupBar := bar_index
+                setupHigh := high
+                setupLow := low
+                prepareCall := crossUp
+                preparePut := crossDown
+                opportunityText := crossUp ? "تهيئة CALL" : "تهيئة PUT"
+                opportunityReason := crossUp ? "انتظار شمعة لاحقة تتجاوز القمة" : "انتظار شمعة لاحقة تكسر القاع"
+                opportunityColor := prepColor
+    // أي إشارة جديدة تصبح الإشارة المعروضة في قسم المتابعة.
+    // استبدال المتابعة لا يعني تنفيذ خروج من الإشارة القديمة.
+    if callSignal or putSignal
+        weakBar := na
+        weakLevel := na
+        bool replacedActive = trackedDirection != 0
+        trackedDirection := callSignal ? 1 : -1
+        lastDirection := trackedDirection
+        trackedEntryBar := bar_index
+        if useWeakExit and (trackedDirection == 1 ? close > open : close < open)
+            weakBar := bar_index
+            weakLevel := trackedDirection == 1 ? (exitReference == "الذيل" ? low : math.min(open, close)) : (exitReference == "الذيل" ? high : math.max(open, close))
+        trackedEntry := newSignalEntry
+        trackedStop := newSignalStop
+        float risk = math.abs(trackedEntry - trackedStop)
+        trackedTarget1 := trackedEntry + trackedDirection * risk * target1R
+        trackedTarget2 := trackedEntry + trackedDirection * risk * secondR
+        optionSignalDirection := trackedDirection
+        optionSignalDate := f_option_date_key(time)
+        optionSignalUnderlyingPrice := trackedEntry
+        secondTargetReached := false
+        firstTargetReached := false
+        trackingText := replacedActive ? "متابعة أحدث إشارة — استُبدلت السابقة" : "متابعة نظرية للإشارة الجديدة"
+        trackingColor := callSignal ? callColor : putColor
+// ═════════════ الرسم ═════════════
+fastPlot = plot(showCloud ? emaFast : na, "EMA السريع", color=fastColor, linewidth=2)
+slowPlot = plot(showCloud ? emaSlow : na, "EMA البطيء", color=slowColor, linewidth=2)
+fill(
+     fastPlot,
+     slowPlot,
+     color=emaFast >= emaSlow ? color.new(callColor, 85) : color.new(putColor, 85),
+     title="غيمة GOLD ORCA")
+plot(
+     showVwap ? vwapLine : na,
+     "VWAP الجلسة",
+     color=vwapColor,
+     linewidth=2,
+     style=plot.style_linebr)
+pendingLevel = setupDirection == 1 ? setupHigh : setupDirection == -1 ? setupLow : na
+plot(
+     showSetupLevel ? pendingLevel : na,
+     "مستوى تأكيد التهيئة",
+     color=prepColor,
+     linewidth=2,
+     style=plot.style_linebr)
+plotshape(
+     showPrepare and prepareCall,
+     title="تهيئة CALL",
+     text="تهيئة CALL",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=prepColor,
+     textcolor=color.black,
+     size=size.small)
+plotshape(
+     showPrepare and preparePut,
+     title="تهيئة PUT",
+     text="تهيئة PUT",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=prepColor,
+     textcolor=color.black,
+     size=size.small)
+plotshape(
+     showSignals and callSignal,
+     title="دخول CALL",
+     text="CALL",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=callColor,
+     textcolor=color.white,
+     size=size.small)
+plotshape(
+     showSignals and putSignal,
+     title="دخول PUT",
+     text="PUT",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=putColor,
+     textcolor=color.white,
+     size=size.small)
+plot(showWeakLevel and useWeakExit ? weakLevel : na, "مستوى الخروج الفني", color=exitColor, linewidth=2, style=plot.style_linebr)
+plotshape(showExitSignals and exitCall, title="خروج CALL", text="خروج CALL", style=shape.labeldown, location=location.abovebar, color=exitColor, textcolor=color.white, size=size.small)
+plotshape(showExitSignals and exitPut, title="خروج PUT", text="خروج PUT", style=shape.labelup, location=location.belowbar, color=exitColor, textcolor=color.white, size=size.small)
+alertcondition(exitCall, "GOLD ORCA — خروج CALL", "GOLD_ORCA|EXIT_CALL|{{ticker}}|{{interval}}|{{close}}|كسر مستوى آخر شمعة صاعدة حسب اختيار الجسم أو الذيل")
+alertcondition(exitPut, "GOLD ORCA — خروج PUT", "GOLD_ORCA|EXIT_PUT|{{ticker}}|{{interval}}|{{close}}|اختراق مستوى آخر شمعة هابطة حسب اختيار الجسم أو الذيل")
+alertcondition(exitCall or exitPut or stopCall or stopPut, "GOLD ORCA — خروج أو وقف", "GOLD_ORCA|EXIT_OR_STOP|{{ticker}}|{{interval}}|{{close}}")
+// ═════════════ عرض الفرصة والمتابعة منفصلين ═════════════
+pending = setupDirection != 0
+pendingStop = pending ?
+     (setupDirection == 1 ? setupLow - buffer : setupHigh + buffer) : na
+pendingRisk = pending ? math.abs(pendingLevel - pendingStop) : na
+pendingT1 = pending ? pendingLevel + setupDirection * pendingRisk * target1R : na
+pendingT2 = pending ? pendingLevel + setupDirection * pendingRisk * secondR : na
+f_price(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+optionSignalToday = optionTodayWeekday and optionSignalDirection != 0 and
+     optionSignalDate == optionTodayDateKey and not na(optionSignalUnderlyingPrice)
+optionAnchorPrice = na(optionRequestAnchor) ? close : optionRequestAnchor
+optionStepNear = optionAnchorPrice < 100 ? 0.5 :
+     optionAnchorPrice < 500 ? 1.0 : 2.5
+optionStepWide = optionAnchorPrice < 100 ? 1.0 :
+     optionAnchorPrice < 500 ? 2.5 : 5.0
+nearStrikeMid = f_round_to_step(optionAnchorPrice, optionStepNear)
+nearStrikeDown = nearStrikeMid - optionStepNear
+nearStrikeUp = nearStrikeMid + optionStepNear
+wideStrikeMid = f_round_to_step(optionAnchorPrice, optionStepWide)
+wideStrikeDown = wideStrikeMid - optionStepWide
+wideStrikeUp = wideStrikeMid + optionStepWide
+optionTestDayOfWeek = dayofweek(timenow, OPTION_TZ)
+optionTestDaysAhead = optionTestDayOfWeek == dayofweek.saturday ? 2 :
+     optionTestDayOfWeek == dayofweek.sunday ? 1 : 0
+optionTestTimestamp = timestamp(
+     OPTION_TZ,
+     year(timenow, OPTION_TZ),
+     month(timenow, OPTION_TZ),
+     dayofmonth(timenow, OPTION_TZ) + optionTestDaysAhead,
+     12,
+     0)
+optionTestDateKey = f_option_date_key(optionTestTimestamp)
+optionTestDirection = optionDataTestSide == "CALL" ? 1 : -1
+optionTestStrike = optionDataTestStrike > 0 ? optionDataTestStrike : nearStrikeMid
+// Freeze the test contract once, before realtime: do not scan every historical strike.
+var string optionTestSymbol = ""
+if barstate.islastconfirmedhistory and showOptionDataTest
+    optionTestSymbol := f_option_ticker(optionTestStrike, optionTestDirection, optionTestDateKey)
+float optionTestPrice = na
+int optionTestBarTime = na
+if showOptionDataTest and optionTestSymbol != "" and (barstate.islastconfirmedhistory or barstate.isrealtime)
+    [testPrice, testTime] = f_option_test_data(optionTestSymbol)
+    optionTestPrice := testPrice
+    optionTestBarTime := testTime
+optionTestStatus = not showOptionDataTest ? "" :
+     na(optionTestPrice) ? "فحص " + optionTestSymbol + " — لا توجد شمعة متاحة" :
+     "فحص " + optionTestSymbol + " — آخر سعر " +
+      str.tostring(optionTestPrice, "0.00####") + " — شمعة " +
+      (na(optionTestBarTime) ? "—" : str.format_time(optionTestBarTime, "dd/MM HH:mm", OPTION_TZ)) +
+      " نيويورك؛ خارج الجلسة قد تكون تاريخية"
+optionRequestWindow = optionTodayWeekday and not na(optionRequestAnchor) and
+     (barstate.islastconfirmedhistory or barstate.isrealtime)
+
+callSymbolNearMid = optionRequestWindow ? f_option_ticker(nearStrikeMid, 1, optionTodayDateKey) : syminfo.tickerid
+callSymbolNearDown = optionRequestWindow ? f_option_ticker(nearStrikeDown, 1, optionTodayDateKey) : syminfo.tickerid
+callSymbolNearUp = optionRequestWindow ? f_option_ticker(nearStrikeUp, 1, optionTodayDateKey) : syminfo.tickerid
+callSymbolWideMid = optionRequestWindow ? f_option_ticker(wideStrikeMid, 1, optionTodayDateKey) : syminfo.tickerid
+callSymbolWideDown = optionRequestWindow ? f_option_ticker(wideStrikeDown, 1, optionTodayDateKey) : syminfo.tickerid
+callSymbolWideUp = optionRequestWindow ? f_option_ticker(wideStrikeUp, 1, optionTodayDateKey) : syminfo.tickerid
+putSymbolNearMid = optionRequestWindow ? f_option_ticker(nearStrikeMid, -1, optionTodayDateKey) : syminfo.tickerid
+putSymbolNearDown = optionRequestWindow ? f_option_ticker(nearStrikeDown, -1, optionTodayDateKey) : syminfo.tickerid
+putSymbolNearUp = optionRequestWindow ? f_option_ticker(nearStrikeUp, -1, optionTodayDateKey) : syminfo.tickerid
+putSymbolWideMid = optionRequestWindow ? f_option_ticker(wideStrikeMid, -1, optionTodayDateKey) : syminfo.tickerid
+putSymbolWideDown = optionRequestWindow ? f_option_ticker(wideStrikeDown, -1, optionTodayDateKey) : syminfo.tickerid
+putSymbolWideUp = optionRequestWindow ? f_option_ticker(wideStrikeUp, -1, optionTodayDateKey) : syminfo.tickerid
+
+callPriceNearMid = f_option_quote(callSymbolNearMid)
+callPriceNearDown = f_option_quote(callSymbolNearDown)
+callPriceNearUp = f_option_quote(callSymbolNearUp)
+callPriceWideMid = f_option_quote(callSymbolWideMid)
+callPriceWideDown = f_option_quote(callSymbolWideDown)
+callPriceWideUp = f_option_quote(callSymbolWideUp)
+putPriceNearMid = f_option_quote(putSymbolNearMid)
+putPriceNearDown = f_option_quote(putSymbolNearDown)
+putPriceNearUp = f_option_quote(putSymbolNearUp)
+putPriceWideMid = f_option_quote(putSymbolWideMid)
+putPriceWideDown = f_option_quote(putSymbolWideDown)
+putPriceWideUp = f_option_quote(putSymbolWideUp)
+
+float todayOptionPrice = na
+float todayOptionStrike = na
+float todayOptionDistance = na
+string todayOptionSymbol = ""
+if barstate.islast and optionSignalToday
+    array<float> candidatePrices = optionSignalDirection == 1 ?
+         array.from(callPriceNearMid, callPriceNearDown, callPriceNearUp,
+              callPriceWideMid, callPriceWideDown, callPriceWideUp) :
+         array.from(putPriceNearMid, putPriceNearDown, putPriceNearUp,
+              putPriceWideMid, putPriceWideDown, putPriceWideUp)
+    array<string> candidateSymbols = optionSignalDirection == 1 ?
+         array.from(callSymbolNearMid, callSymbolNearDown, callSymbolNearUp,
+              callSymbolWideMid, callSymbolWideDown, callSymbolWideUp) :
+         array.from(putSymbolNearMid, putSymbolNearDown, putSymbolNearUp,
+              putSymbolWideMid, putSymbolWideDown, putSymbolWideUp)
+    array<float> candidateStrikes = array.from(
+         nearStrikeMid, nearStrikeDown, nearStrikeUp,
+         wideStrikeMid, wideStrikeDown, wideStrikeUp)
+    for candidateIndex = 0 to 5
+        float candidatePrice = array.get(candidatePrices, candidateIndex)
+        float candidateStrike = array.get(candidateStrikes, candidateIndex)
+        if not na(candidatePrice) and candidatePrice > 0
+            float strikeDistance = math.abs(candidateStrike - optionSignalUnderlyingPrice)
+            if na(todayOptionDistance) or strikeDistance < todayOptionDistance
+                todayOptionPrice := candidatePrice
+                todayOptionStrike := candidateStrike
+                todayOptionDistance := strikeDistance
+                todayOptionSymbol := array.get(candidateSymbols, candidateIndex)
+
+optionOutsideCandidateRange = not na(todayOptionDistance) and
+     todayOptionDistance > optionStepWide * 1.5
+if optionOutsideCandidateRange
+    todayOptionPrice := na
+    todayOptionStrike := na
+    todayOptionSymbol := ""
+
+todayOptionStatus = not optionTodayWeekday ? "لا يوجد استحقاق اليوم" :
+     not optionSignalToday ? "بانتظار إشارة اليوم" :
+     todayOptionSymbol != "" ? "آخر سعر: " + f_price(todayOptionPrice) :
+     optionOutsideCandidateRange ? "السهم خارج نطاق السترايكات المجهزة" :
+     "لا يوجد سعر حديث متاح"
+fontSize = fontChoice == "صغير" ? size.small : fontChoice == "كبير" ? size.large : size.normal
+tablePosition = switch tableLocation
+    "أسفل اليمين" => position.bottom_right
+    "أعلى اليسار" => position.top_left
+    "أسفل اليسار" => position.bottom_left
+    => position.top_right
+var table dashboard = table.new(position.top_right, 8, 22, frame_color=headerColor, frame_width=1, border_color=color.new(color.white, 85), border_width=1)
+if barstate.isfirst
+    table.merge_cells(dashboard, 0, 0, 1, 0)
+    table.merge_cells(dashboard, 2, 0, 7, 0)
+    for r in array.from(3, 7, 11, 13, 14)
+        table.merge_cells(dashboard, 0, r, 7, r)
+    table.merge_cells(dashboard, 0, 4, 2, 4)
+    for r in array.from(5, 6)
+        table.merge_cells(dashboard, 1, r, 2, r)
+        table.merge_cells(dashboard, 3, r, 5, r)
+        table.merge_cells(dashboard, 6, r, 7, r)
+    for r in array.from(8, 9, 10, 12)
+        table.merge_cells(dashboard, 0, r, 2, r)
+        table.merge_cells(dashboard, 3, r, 5, r)
+        table.merge_cells(dashboard, 6, r, 7, r)
+f_box(int c, int r, string value, color bg, string tip="") =>
+    table.cell(dashboard, c, r, value, bgcolor=bg, text_color=textColor, text_size=fontSize, tooltip=tip)
+// نطاق اليوم من جلسة السهم؛ لا يمثل نطاقًا متوقعًا لسعر الخيار.
+var float dayHigh = na
+var float dayLow = na
+if newSession
+    dayHigh := high
+    dayLow := low
+else if inSession
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow := na(dayLow) ? low : math.min(dayLow, low)
+if barstate.islast
+    table.set_position(dashboard, tablePosition)
+    if not showTable
+        table.clear(dashboard, 0, 0, 7, 21)
+// ═════════════ التنبيهات ═════════════
+alertcondition(
+     prepareCall,
+     "GOLD ORCA — تهيئة CALL",
+     "GOLD_ORCA|PREPARE_CALL|{{ticker}}|{{interval}}|{{close}}")
+alertcondition(
+     preparePut,
+     "GOLD ORCA — تهيئة PUT",
+     "GOLD_ORCA|PREPARE_PUT|{{ticker}}|{{interval}}|{{close}}")
+alertcondition(
+     callSignal,
+     "GOLD ORCA — دخول CALL",
+     "GOLD_ORCA|CALL|{{ticker}}|{{interval}}|{{close}}")
+alertcondition(
+     putSignal,
+     "GOLD ORCA — دخول PUT",
+     "GOLD_ORCA|PUT|{{ticker}}|{{interval}}|{{close}}")
+
+// أرسل أربع حالات منفصلة: تهيئة CALL/PUT أو دخول CALL/PUT مؤكّد.
+f_json_escape(string value) =>
+     str.replace_all(
+         str.replace_all(
+             str.replace_all(
+                 str.replace_all(value, "\\", "\\\\"),
+                 "\"", "\\\""),
+             "\n", "\\n"),
+         "\r", "\\r")
+
+f_tv_signal_payload(string signalType, string direction) =>
+     "{\"secret\":\"" + f_json_escape(webhookSecret) +
+     "\",\"source\":\"GOLD_ORCA_0DTE_PINE\",\"ticker\":\"" + f_json_escape(syminfo.tickerid) +
+     "\",\"signal_type\":\"" + signalType +
+     "\",\"direction\":\"" + direction +
+     "\",\"timeframe\":\"" + f_json_escape(timeframe.period) +
+     "\",\"bar_close_time_ms\":" + str.tostring(time_close) +
+     ",\"signal_price\":" + str.tostring(close, format.mintick) +
+     ",\"event_id\":\"" + f_json_escape(
+          syminfo.tickerid + "|" + timeframe.period + "|" + signalType + "|" + str.tostring(time_close)) +
+     "\"}"
+
+varip int lastOrcaAlertBarClose = na
+freshConfirmedAlertBar = barstate.isrealtime and barstate.isconfirmed and
+     not na(time_close) and timenow >= time_close and timenow - time_close <= 300000
+if sendOrcaAlerts and webhookSecretReady and freshConfirmedAlertBar and
+     (na(lastOrcaAlertBarClose) or time_close != lastOrcaAlertBarClose)
+    if callSignal
+        alert(f_tv_signal_payload("CALL", "CALL"), alert.freq_once_per_bar_close)
+        lastOrcaAlertBarClose := time_close
+    else if putSignal
+        alert(f_tv_signal_payload("PUT", "PUT"), alert.freq_once_per_bar_close)
+        lastOrcaAlertBarClose := time_close
+    else if prepareCall
+        alert(f_tv_signal_payload("PREPARE_CALL", "CALL"), alert.freq_once_per_bar_close)
+        lastOrcaAlertBarClose := time_close
+    else if preparePut
+        alert(f_tv_signal_payload("PREPARE_PUT", "PUT"), alert.freq_once_per_bar_close)
+        lastOrcaAlertBarClose := time_close
+
+// محرك مستقل لكل رمز، بنفس شروط سهم الشارت.
+f_watchEngine() =>
+    emaFast = ta.ema(close, fastLength)
+    emaSlow = ta.ema(close, slowLength)
+    cloudTop = math.max(emaFast, emaSlow)
+    cloudBottom = math.min(emaFast, emaSlow)
+    crossUp = ta.crossover(close, cloudTop)
+    crossDown = ta.crossunder(close, cloudBottom)
+    historyReady = not na(cloudTop[1]) and not na(cloudBottom[1])
+    chartSupported = timeframe.isintraday and chart.is_standard
+    // ═════════════ VWAP الجلسة ═════════════
+    inSession = timeframe.isintraday and not na(time(timeframe.period, sessionHours, sessionTimezone))
+    localDate = year(time, sessionTimezone) * 10000 +
+         month(time, sessionTimezone) * 100 +
+         dayofmonth(time, sessionTimezone)
+    newDate = na(localDate[1]) or localDate != localDate[1]
+    newSession = inSession and (not inSession[1] or newDate)
+    sessionStartHour = int(str.tonumber(str.substring(sessionHours, 0, 2)))
+    sessionStartMinute = int(str.tonumber(str.substring(sessionHours, 2, 4)))
+    atSessionStart = hour(time, sessionTimezone) == sessionStartHour and
+         minute(time, sessionTimezone) == sessionStartMinute
+    var float cumulativePV = 0.0
+    var float cumulativeVolume = 0.0
+    var bool sessionDataValid = false
+    var int sessionBarCount = 0
+    if newSession
+        cumulativePV := 0.0
+        cumulativeVolume := 0.0
+        sessionDataValid := atSessionStart
+        sessionBarCount := 0
+    if inSession
+        sessionBarCount += 1
+        // لا نعرض VWAP كامل الجلسة إذا كانت بياناتها ناقصة.
+        if not newSession and time > time_close[1]
+            sessionDataValid := false
+        if na(volume) or volume < 0
+            sessionDataValid := false
+        else
+            cumulativePV += hlc3 * volume
+            cumulativeVolume += volume
+    vwapLine = inSession and sessionDataValid and cumulativeVolume > 0 ?
+         cumulativePV / cumulativeVolume : na
+    vwapAvailable = not na(vwapLine)
+    slopeReady = vwapAvailable and sessionBarCount > slopeBars and
+         not na(vwapLine[slopeBars])
+    vwapRising = slopeReady and vwapLine > vwapLine[slopeBars]
+    vwapFalling = slopeReady and vwapLine < vwapLine[slopeBars]
+    // تشغيل شرط الميل يفعّل شرط موقع السعر أيضًا.
+    vwapGateEnabled = useVwapFilter or useVwapSlope
+    callVwapPass = not vwapGateEnabled or
+         (vwapAvailable and close > vwapLine and (not useVwapSlope or vwapRising))
+    putVwapPass = not vwapGateEnabled or
+         (vwapAvailable and close < vwapLine and (not useVwapSlope or vwapFalling))
+    signalSessionPass = not regularSessionOnly or inSession
+    // ═════════════ التهيئة مستقلة عن متابعة الإشارة السابقة ═════════════
+    var int setupDirection = 0
+    var int setupBar = na
+    var float setupHigh = na
+    var float setupLow = na
+    var string opportunityText = "انتظار تهيئة جديدة"
+    var string opportunityReason = "اختراق الغيمة أو كسرها أولًا"
+    var color opportunityColor = color.orange
+    bool prepareCall = false
+    bool preparePut = false
+    bool callSignal = false
+    bool putSignal = false
+    float newSignalStop = na
+    float newSignalEntry = na
+    buffer = stopTicks * syminfo.mintick
+    secondR = math.max(target1R, target2R)
+    // ═════════════ متابعة آخر إشارة فقط ═════════════
+    var int trackedDirection = 0
+    var int lastDirection = 0
+    var int trackedEntryBar = na
+    var float trackedEntry = na
+    var float trackedStop = na
+    var float trackedTarget1 = na
+    var float trackedTarget2 = na
+    var string trackingText = "لا توجد إشارة سابقة"
+    var color trackingColor = color.orange
+    var bool firstTargetReached = false
+    var bool secondTargetReached = false
+    var int weakBar = na
+    var float weakLevel = na
+    bool weakCall = false
+    bool weakPut = false
+    bool exitCall = false
+    bool exitPut = false
+    bool stopCall = false
+    bool stopPut = false
+    // ═════════════ معالجة الشموع المغلقة ═════════════
+    if historyReady
+        // متابعة آخر إشارة لا تتحكم في السماح بالإشارات الجديدة.
+        if trackedDirection != 0 and bar_index > trackedEntryBar
+            bool touchedStop = trackedDirection == 1 ? low <= trackedStop : high >= trackedStop
+            bool touchedT1 = trackedDirection == 1 ? high >= trackedTarget1 : low <= trackedTarget1
+            bool touchedT2 = trackedDirection == 1 ? high >= trackedTarget2 : low <= trackedTarget2
+            if touchedStop
+                stopCall := trackedDirection == 1
+                stopPut := trackedDirection == -1
+                bool ambiguousTouch = touchedT2 or (touchedT1 and not firstTargetReached)
+                if ambiguousTouch
+                    trackingText := "وقف وهدف بنفس الشمعة — الترتيب مجهول"
+                    trackingColor := waitColor
+                else
+                    trackingText := "وصل مستوى الوقف"
+                    trackingColor := putColor
+                trackedDirection := 0
+            else if touchedT2 and not secondTargetReached
+                secondTargetReached := true
+                firstTargetReached := true
+                trackingText := useWeakExit ? "وصل الهدف الثاني — متابعة الخروج الفني" : "وصل الهدف الثاني"
+                trackingColor := callColor
+                if not useWeakExit
+                    trackedDirection := 0
+            else if touchedT1 and not firstTargetReached
+                firstTargetReached := true
+                trackingText := "وصل الهدف الأول — متابعة الثاني"
+                trackingColor := callColor
+        // CALL: قاع أحدث شمعة صاعدة. PUT: قمة أحدث شمعة هابطة.
+        // نفحص المرجع السابق قبل تحديثه؛ الشمعة الحالية لا تؤكد كسر نفسها.
+        if useWeakExit and trackedDirection != 0 and bar_index > trackedEntryBar
+            bool broken = not na(weakBar) and bar_index > weakBar and (trackedDirection == 1 ? close < weakLevel : close > weakLevel)
+            if broken
+                exitCall := trackedDirection == 1
+                exitPut := trackedDirection == -1
+                trackingText := exitCall ? "احجز ربحك — خروج CALL" : "احجز ربحك — خروج PUT"
+                trackingColor := exitColor
+                trackedDirection := 0
+            else if (trackedDirection == 1 ? close > open : close < open)
+                weakBar := bar_index
+                weakLevel := trackedDirection == 1 ? (exitReference == "الذيل" ? low : math.min(open, close)) : (exitReference == "الذيل" ? high : math.max(open, close))
+        if trackedDirection == 0
+            weakBar := na
+            weakLevel := na
+        opportunityText := "انتظار تهيئة جديدة"
+        opportunityReason := "اختراق الغيمة أو كسرها أولًا"
+        opportunityColor := waitColor
+        // لا تمتد تهيئة الجلسة الماضية إلى جلسة جديدة.
+        if newSession or (regularSessionOnly and not inSession)
+            setupDirection := 0
+            setupBar := na
+            setupHigh := na
+            setupLow := na
+        if not chartSupported
+            opportunityText := "الشارت غير مناسب"
+            opportunityReason := "استخدم شموعًا عادية وفاصلًا لحظيًا"
+        else if not signalSessionPass
+            opportunityText := "خارج جلسة الإشارات"
+            opportunityReason := "انتظار الجلسة المحددة"
+        else
+            // أولًا: فحص شمعة تهيئة سابقة.
+            if setupDirection != 0 and bar_index > setupBar
+                bool expired = setupMaxBars > 0 and bar_index - setupBar > setupMaxBars
+                bool cancelled = setupDirection == 1 ? close <= cloudTop : close >= cloudBottom
+                bool levelBroken = setupDirection == 1 ?
+                     (breakMode == "الإغلاق" ? close > setupHigh : high > setupHigh) :
+                     (breakMode == "الإغلاق" ? close < setupLow : low < setupLow)
+                bool filterPassed = setupDirection == 1 ? callVwapPass : putVwapPass
+                if expired or cancelled
+                    opportunityText := expired ? "انتهت صلاحية التهيئة" : "أُلغيت التهيئة"
+                    opportunityReason := expired ? "انتظار اختراق جديد" : "رجع الإغلاق داخل الغيمة أو تجاوزها عكسيًا"
+                    setupDirection := 0
+                else if levelBroken and filterPassed
+                    float candidateStop = setupDirection == 1 ? setupLow - buffer : setupHigh + buffer
+                    float candidateRisk = setupDirection == 1 ? close - candidateStop : candidateStop - close
+                    if candidateRisk > 0
+                        callSignal := setupDirection == 1
+                        putSignal := setupDirection == -1
+                        newSignalEntry := close
+                        newSignalStop := candidateStop
+                        opportunityText := callSignal ? "CALL — إشارة جديدة" : "PUT — إشارة جديدة"
+                        opportunityReason := "تأكد كسر شمعة التهيئة واجتازت الفلاتر"
+                        opportunityColor := callSignal ? callColor : putColor
+                        setupDirection := 0
+                else
+                    opportunityText := setupDirection == 1 ? "تهيئة CALL" : "تهيئة PUT"
+                    opportunityColor := prepColor
+                    if not levelBroken
+                        opportunityReason := setupDirection == 1 ? "انتظار اختراق قمة شمعة التهيئة" : "انتظار كسر قاع شمعة التهيئة"
+                    else if not vwapAvailable
+                        opportunityReason := "VWAP غير متاح أو بيانات الجلسة ناقصة"
+                    else if setupDirection == 1 and close <= vwapLine
+                        opportunityReason := "الكسر تحقق لكن الإغلاق ليس فوق VWAP"
+                    else if setupDirection == -1 and close >= vwapLine
+                        opportunityReason := "الكسر تحقق لكن الإغلاق ليس تحت VWAP"
+                    else
+                        opportunityReason := "انتظار توافق ميل VWAP"
+            if setupDirection == 0
+                setupBar := na
+                setupHigh := na
+                setupLow := na
+            // ثانيًا: تسجيل تهيئة جديدة.
+            // لا دخول على شمعة التهيئة نفسها.
+            if not callSignal and not putSignal
+                if crossUp or crossDown
+                    setupDirection := crossUp ? 1 : -1
+                    setupBar := bar_index
+                    setupHigh := high
+                    setupLow := low
+                    prepareCall := crossUp
+                    preparePut := crossDown
+                    opportunityText := crossUp ? "تهيئة CALL" : "تهيئة PUT"
+                    opportunityReason := crossUp ? "انتظار شمعة لاحقة تتجاوز القمة" : "انتظار شمعة لاحقة تكسر القاع"
+                    opportunityColor := prepColor
+        // أي إشارة جديدة تصبح الإشارة المعروضة في قسم المتابعة.
+        // استبدال المتابعة لا يعني تنفيذ خروج من الإشارة القديمة.
+        if callSignal or putSignal
+            weakBar := na
+            weakLevel := na
+            bool replacedActive = trackedDirection != 0
+            trackedDirection := callSignal ? 1 : -1
+            lastDirection := trackedDirection
+            trackedEntryBar := bar_index
+            if useWeakExit and (trackedDirection == 1 ? close > open : close < open)
+                weakBar := bar_index
+                weakLevel := trackedDirection == 1 ? (exitReference == "الذيل" ? low : math.min(open, close)) : (exitReference == "الذيل" ? high : math.max(open, close))
+            trackedEntry := newSignalEntry
+            trackedStop := newSignalStop
+            float risk = math.abs(trackedEntry - trackedStop)
+            trackedTarget1 := trackedEntry + trackedDirection * risk * target1R
+            trackedTarget2 := trackedEntry + trackedDirection * risk * secondR
+            secondTargetReached := false
+            firstTargetReached := false
+            trackingText := replacedActive ? "متابعة أحدث إشارة — استُبدلت السابقة" : "متابعة نظرية للإشارة الجديدة"
+            trackingColor := callSignal ? callColor : putColor
+    string wlBasis = na(trackedEntry) ? "لا توجد إشارة" : trackedDirection != 0 ? "إشارة قيد المتابعة" : "إشارة منتهية"
+    string wlE = na(trackedEntry) ? "—" : str.tostring(trackedEntry, format.mintick)
+    string wlS = na(trackedEntry) ? "—" : str.tostring(trackedStop, format.mintick)
+    string wlA = na(trackedEntry) ? "—" : str.tostring(trackedTarget1, format.mintick)
+    string wlB = na(trackedEntry) ? "—" : str.tostring(trackedTarget2, format.mintick)
+    [opportunityText, trackingText, opportunityReason, opportunityColor, wlBasis, wlE, wlS, wlA, wlB, time_close, lastDirection, firstTargetReached, secondTargetReached, opportunityText[1], trackingText[1], opportunityReason[1], opportunityColor[1], wlBasis[1], wlE[1], wlS[1], wlA[1], wlB[1], time_close[1], lastDirection[1], firstTargetReached[1], secondTargetReached[1]]
+
+f_frameState() =>
+    [o, tr, reason, col, basis, en, st, a, b, tm, d, h1, h2, po, ptr, pr, pc, pb, pe, ps, pa, pz, pt, pd, ph1, ph2] = f_watchEngine()
+    int active = basis == "إشارة قيد المتابعة" ? d : 0
+    [active, tm, active[1], tm[1]]
+f_lowerState() =>
+    [d, t, pd, pt] = f_frameState()
+    [d, t]
+f_tfState(string symbol, string tf, int cutoff) =>
+    int result = na
+    if timeframe.in_seconds(tf) < timeframe.in_seconds()
+        [states, closes] = request.security_lower_tf(symbol, tf, f_lowerState(), ignore_invalid_symbol=true)
+        if array.size(states) > 0
+            for j = 0 to array.size(states) - 1
+                if array.get(closes, j) <= cutoff
+                    result := array.get(states, j)
+    else
+        [d, t, pd, pt] = request.security(symbol, tf, f_frameState(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+        result := not na(t) and t <= cutoff ? d : not na(pt) and pt <= cutoff ? pd : na
+    result
+f_stateText(int d) =>
+    na(d) ? "بيانات غير متاحة" : d == 1 ? "CALL" : d == -1 ? "PUT" : "لا صفقة"
+f_stateColor(int d) =>
+    na(d) ? backgroundColor : d == 1 ? callColor : d == -1 ? putColor : waitColor
+f_decision(string state, string basis) =>
+    str.contains(state, "احجز ربحك") ? "احجز ربحك" : str.contains(state, "وقف") ? "وقف / خروج" : basis == "إشارة قيد المتابعة" ? "متابعة" : "لا صفقة"
+
+watchSymbols = array.from(watch1, watch2, watch3, watch4, watch5, watch6, syminfo.tickerid)
+// مرجع الإغلاق من الشارت، لا من الساعة الحقيقية، كي يعمل في إعادة العرض.
+closedCutoff = barstate.isconfirmed ? time_close : time_close[1]
+// الشركات جزء من الجدول الأساسي وتستخدم مكانه وألوانه وحجم خطه.
+if barstate.islast and showTable
+    if showWatchlist
+        headings = array.from("الأهداف", "الوقف", "الدخول", "5 دقائق", "3 دقائق", "القرار", "الصفقة", "الرمز")
+        for c = 0 to 7
+            f_box(c, 15, array.get(headings, c), royalBlue)
+    else
+        table.clear(dashboard, 0, 15, 7, 21)
+
+// الطلبات تعمل على كامل التاريخ، وليست محصورة بآخر شمعة.
+for i = 0 to 6
+    string symbol = array.get(watchSymbols, i)
+    string requestSymbol = ticker.modify(symbol, session=syminfo.session)
+    [o0, t0, r0, c0, b0, e0, s0, a0, z0, time0, d0, h10, h20, o1, t1, r1, c1, b1, e1, s1, a1, z1, time1, d1, h11, h21] = request.security(requestSymbol, timeframe.period, f_watchEngine(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    int frameCutoff = barstate.isrealtime ? timenow : time_close
+    int state3 = f_tfState(requestSymbol, "3", frameCutoff)
+    int state5 = f_tfState(requestSymbol, "5", frameCutoff)
+    bool useCurrent = not na(time0) and time0 <= closedCutoff
+    int snapshotTime = useCurrent ? time0 : time1
+    bool fresh = not na(snapshotTime) and snapshotTime == closedCutoff
+    string rowOpportunity = useCurrent ? o0 : o1
+    string rowTracking = useCurrent ? t0 : t1
+    string rowReason = useCurrent ? r0 : r1
+    color rowColor = useCurrent ? c0 : c1
+    string rowBasis = useCurrent ? b0 : b1
+    string rowEntry = useCurrent ? e0 : e1
+    string rowStop = useCurrent ? s0 : s1
+    string rowT1 = useCurrent ? a0 : a1
+    string rowT2 = useCurrent ? z0 : z1
+    int rowDirection = useCurrent ? d0 : d1
+    bool rowHit1 = useCurrent ? h10 : h11
+    bool rowHit2 = useCurrent ? h20 : h21
+
+    // إذا اختير سهم الشارت نفسه نستعمل حالته الأصلية تمامًا.
+    if ticker.standard(symbol) == ticker.standard(syminfo.tickerid)
+        fresh := not na(closedCutoff) and historyReady
+        rowOpportunity := opportunityText
+        rowTracking := (lastDirection == 1 ? "CALL | " : lastDirection == -1 ? "PUT | " : "") + trackingText
+        rowReason := opportunityReason
+        rowColor := opportunityColor
+        rowBasis := na(trackedEntry) ? "—" : trackedDirection != 0 ? "إشارة قيد المتابعة" : "إشارة منتهية"
+        rowEntry := f_price(trackedEntry)
+        rowStop := f_price(trackedStop)
+        rowT1 := f_price(trackedTarget1)
+        rowT2 := f_price(trackedTarget2)
+        rowDirection := lastDirection
+        rowHit1 := firstTargetReached
+        rowHit2 := secondTargetReached
+
+    if barstate.islast and showTable and showWatchlist and i < 6
+        parts = str.split(symbol, ":")
+        string shortName = array.get(parts, array.size(parts) - 1)
+        int r = 16 + i
+        string details = fresh ? rowReason + "\n" + rowTracking : "بيانات غير متاحة"
+        string decision = fresh ? f_decision(rowTracking, rowBasis) : "—"
+        f_box(7, r, shortName, backgroundColor, details)
+        f_box(6, r, fresh ? (rowDirection == 1 ? "CALL" : rowDirection == -1 ? "PUT" : "—") : "—", fresh ? (rowDirection == 1 ? callColor : rowDirection == -1 ? putColor : backgroundColor) : backgroundColor, "اتجاه آخر إشارة؛ الخانات الزمنية تعرض الصفقة النشطة")
+        f_box(5, r, decision, decision == "احجز ربحك" ? exitColor : backgroundColor, details)
+        f_box(4, r, f_stateText(state3), f_stateColor(state3))
+        f_box(3, r, f_stateText(state5), f_stateColor(state5))
+        f_box(2, r, fresh ? rowEntry : "—", backgroundColor)
+        f_box(1, r, fresh ? rowStop : "—", stopCellColor)
+        f_box(0, r, fresh ? rowT1 + (rowHit1 ? " ✓" : " ○") + "\n" + rowT2 + (rowHit2 ? " ✓" : " ○") : "—", fresh and rowHit2 ? callColor : royalBlue)
+    if barstate.islast and showTable and i == 6
+        string chartBasis = trackedDirection != 0 ? "إشارة قيد المتابعة" : "إشارة منتهية"
+        string decision = f_decision(trackingText, chartBasis)
+        bool hasOption = todayOptionSymbol != "" and not na(todayOptionPrice)
+        string unavailableTip = "هذه الخانة موجودة لمطابقة التصميم، لكن معادلة المؤشر لا تحسبها."
+        f_box(2, 0, "GOLD ORCA — عقد اليوم المستقل", headerColor)
+        f_box(0, 0, hasOption ? "✓ سعر متاح" : "السعر غير متاح", hasOption ? callColor : waitColor, "يعتمد توفر السعر على بيانات TradingView للعقد")
+        labels = array.from("الأهداف", "أداء", "سعر العقد", "دخول", "انتهاء", "رمز العقد", "إشارة", "السهم")
+        for c = 0 to 7
+            f_box(c, 1, array.get(labels, c), headerColor)
+        f_box(7, 2, syminfo.ticker, backgroundColor)
+        f_box(6, 2, optionSignalToday ? (optionSignalDirection == 1 ? "CALL" : "PUT") : "—", optionSignalToday ? (optionSignalDirection == 1 ? callColor : putColor) : backgroundColor)
+        f_box(5, 2, hasOption ? todayOptionSymbol : "—", royalBlue, hasOption ? "رمز عقد TradingView لليوم.\nالسترايك: " + str.tostring(todayOptionStrike, "0.####") : todayOptionStatus)
+        f_box(4, 2, hasOption ? str.format_time(timenow, "dd/MM/yy", OPTION_TZ) : "—", backgroundColor)
+        f_box(3, 2, "—", backgroundColor, unavailableTip)
+        f_box(2, 2, hasOption ? str.tostring(todayOptionPrice, "0.00####") : "—", backgroundColor, "آخر إغلاق متاح للعقد على فاصل الشارت؛ ليس Bid/Ask ولا سعر تنفيذ مضمون")
+        f_box(1, 2, "—", callColor, unavailableTip)
+        f_box(0, 2, "—", callColor, unavailableTip)
+        f_box(0, 3, "% الأهداف | غير محسوبة", headerColor, unavailableTip)
+        percentages = array.from("150%", "100%", "85%", "45%", "20%")
+        for c = 3 to 7
+            f_box(c, 4, array.get(percentages, c - 3) + "\n—", royalBlue, "هدف نسبة للعقد غير محسوب؛ لا يُربط بأهداف السهم")
+        f_box(0, 4, "التقدم —/5", headerColor, unavailableTip)
+        f_box(6, 5, "الإجراء\n" + decision, decision == "احجز ربحك" ? exitColor : headerColor, trackingText)
+        f_box(3, 5, "نطاق اليوم\n" + f_price(dayLow) + "–" + f_price(dayHigh), royalBlue)
+        f_box(1, 5, "النشاط\n—", callColor, unavailableTip)
+        f_box(0, 5, "الأوبشن\n—", callColor, unavailableTip)
+        f_box(6, 6, "تقدير هـ1\n—", royalBlue, unavailableTip + "\nهدف السهم الحالي: " + f_price(trackedTarget1))
+        f_box(3, 6, "تقدير هـ2\n—", royalBlue, unavailableTip + "\nهدف السهم الحالي: " + f_price(trackedTarget2))
+        f_box(1, 6, "تقدير هـ3\n—", royalBlue, unavailableTip)
+        f_box(0, 6, "جودة البيانات\n—", callColor, unavailableTip)
+        f_box(0, 7, "اتجاه الفريمات", royalBlue)
+        f_box(6, 8, "الفريم", royalBlue)
+        f_box(3, 8, "السابقة", royalBlue)
+        f_box(0, 8, "الحالية", royalBlue)
+        f_box(6, 9, "3 دقائق", backgroundColor)
+        f_box(3, 9, "—", royalBlue, unavailableTip)
+        f_box(0, 9, f_stateText(state3), f_stateColor(state3))
+        f_box(6, 10, "5 دقائق", backgroundColor)
+        f_box(3, 10, "—", royalBlue, unavailableTip)
+        f_box(0, 10, f_stateText(state5), f_stateColor(state5))
+        bool aligned = not na(state3) and not na(state5) and state3 != 0 and state3 == state5
+        f_box(0, 11, "قوة الاتجاه %", royalBlue)
+        f_box(6, 12, "CALL\n—", callColor, unavailableTip)
+        f_box(3, 12, "—", royalBlue, unavailableTip)
+        f_box(0, 12, "PUT\n—", putColor, unavailableTip)
+        f_box(0, 13, aligned ? "توافق الفاصلين | " + f_stateText(state3) : "توافق الفاصلين | لا توافق نشط", royalBlue, "يعرض التوافق بين حالة الفاصلين؛ ليس نسبة نجاح")
+        f_box(0, 14, showOptionDataTest ? todayOptionStatus + "\n" + optionTestStatus : todayOptionStatus,
+             showOptionDataTest and not na(optionTestPrice) ? royalBlue : hasOption ? callColor : backgroundColor,
+             "فحص مستقل لرمز العقد المحدد/المقترح. السعر هو آخر close والوقت هو شمعة العقد الأخيرة؛ ظهور سعر خارج جلسة السوق لا يثبت أن البيانات مباشرة. تاريخ الاختبار ينتقل إلى الاثنين في عطلة نهاية الأسبوع.")
